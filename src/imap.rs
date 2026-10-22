@@ -16,7 +16,15 @@ use crate::oauth::xoauth2_string;
 
 pub type Session = async_imap::Session<TlsStream<TcpStream>>;
 
+/// Deadline for opening a session: TCP connect, TLS handshake, greeting and login together.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for a single short command (NOOP, SELECT) issued outside a tool's own work.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for everything one tool call does with a session. Generous, because a call may
+/// fetch large bodies or append a message with attachments.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// Deadline for LOGOUT; a session being discarded is not worth waiting on.
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub enum Credential {
     Password(String),
@@ -34,16 +42,29 @@ impl async_imap::Authenticator for &XOauth2 {
 }
 
 pub async fn connect(account: &Account, cred: &Credential) -> Result<Session> {
+    tokio::time::timeout(CONNECT_TIMEOUT, open_session(account, cred))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out after {}s connecting to {}",
+                CONNECT_TIMEOUT.as_secs(),
+                account.imap_host
+            )
+        })?
+}
+
+/// Log out, but don't wait long: the session is being discarded either way.
+pub async fn logout(mut s: Session) {
+    let _ = tokio::time::timeout(LOGOUT_TIMEOUT, s.logout()).await;
+}
+
+async fn open_session(account: &Account, cred: &Credential) -> Result<Session> {
     let host = account
         .imap_host
         .as_str();
-    let tcp = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        TcpStream::connect((host, account.imap_port)),
-    )
-    .await
-    .map_err(|_| anyhow!("timed out connecting to {host}"))?
-    .with_context(|| format!("connecting to {host}:{}", account.imap_port))?;
+    let tcp = TcpStream::connect((host, account.imap_port))
+        .await
+        .with_context(|| format!("connecting to {host}:{}", account.imap_port))?;
     let tls = TlsConnector::from(crate::tls::client_config())
         .connect(ServerName::try_from(host.to_owned())?, tcp)
         .await
@@ -94,14 +115,12 @@ impl Pool {
             .lock()
             .await
             .remove(account_id)
-            && let Some(mut s) = slot
+            && let Some(s) = slot
                 .lock()
                 .await
                 .take()
         {
-            let _ = s
-                .logout()
-                .await;
+            logout(s).await;
         }
     }
 }
@@ -294,11 +313,29 @@ pub async fn fetch_raw(s: &mut Session, uid: u32) -> Result<(Vec<u8>, Vec<String
     ))
 }
 
+/// An IMAP sequence set for `uids`, with consecutive runs collapsed into ranges
+/// (`[1, 2, 3, 7]` → `1:3,7`) so large selections stay within servers' line limits.
 pub fn uid_set(uids: &[u32]) -> String {
-    uids.iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i];
+        let mut end = start;
+        while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
+            end += 1;
+            i += 1;
+        }
+        parts.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}:{end}")
+        });
+        i += 1;
+    }
+    parts.join(",")
 }
 
 pub async fn store_flags(s: &mut Session, uids: &[u32], op: &str, flags: &[String]) -> Result<()> {
@@ -330,7 +367,16 @@ pub async fn move_messages(s: &mut Session, uids: &[u32], to: &str) -> Result<()
     Ok(())
 }
 
+/// Permanently remove exactly `uids` (already flagged `\Deleted`) from the selected mailbox.
+///
+/// With UIDPLUS this is `UID EXPUNGE`. Without it, a plain `EXPUNGE` would also remove every
+/// other message flagged `\Deleted` (by another client, say), so those are unflagged around
+/// the expunge and flagged again afterwards. If that last step fails, they keep their content
+/// and only lose the flag, which errs on the side of keeping mail.
 pub async fn expunge_uids(s: &mut Session, uids: &[u32]) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
     let caps = s
         .capabilities()
         .await?;
@@ -340,14 +386,33 @@ pub async fn expunge_uids(s: &mut Session, uids: &[u32]) -> Result<()> {
             .await?
             .try_collect()
             .await?;
-    } else {
-        let _: Vec<_> = s
-            .expunge()
+        return Ok(());
+    }
+    let mut others: Vec<u32> = s
+        .uid_search("DELETED")
+        .await?
+        .into_iter()
+        .filter(|u| !uids.contains(u))
+        .collect();
+    others.sort_unstable();
+    let deleted = [String::from("\\Deleted")];
+    store_flags(s, &others, "-", &deleted).await?;
+    let expunged: Result<Vec<_>> = async {
+        Ok(s.expunge()
             .await?
             .try_collect()
-            .await?;
+            .await?)
     }
-    Ok(())
+    .await;
+    let restored = store_flags(s, &others, "+", &deleted).await;
+    expunged?;
+    restored.with_context(|| {
+        format!(
+            "expunged, but could not re-flag {} other message(s) as \\Deleted: {}",
+            others.len(),
+            uid_set(&others)
+        )
+    })
 }
 
 /// Quote a string for use as an IMAP astring in SEARCH etc.
@@ -360,4 +425,44 @@ pub fn quote(s: &str) -> Result<String> {
         s.replace('\\', "\\\\")
             .replace('"', "\\\"")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uid_set_collapses_runs_into_ranges() {
+        assert_eq!(uid_set(&[1, 2, 3, 7]), "1:3,7");
+        assert_eq!(uid_set(&[9, 3, 4, 8, 3]), "3:4,8:9");
+        assert_eq!(uid_set(&[42]), "42");
+        assert_eq!(uid_set(&[]), "");
+    }
+
+    #[test]
+    fn uid_set_keeps_large_selections_short() {
+        let uids: Vec<u32> = (1..=20_000).collect();
+        assert_eq!(uid_set(&uids), "1:20000");
+    }
+
+    #[test]
+    fn uid_set_handles_the_top_of_the_range() {
+        assert_eq!(
+            uid_set(&[u32::MAX - 1, u32::MAX]),
+            format!("{}:{}", u32::MAX - 1, u32::MAX)
+        );
+    }
+
+    #[test]
+    fn quote_escapes_quotes_and_backslashes() {
+        assert_eq!(quote("plain").unwrap(), "\"plain\"");
+        assert_eq!(quote(r#"say "hi""#).unwrap(), r#""say \"hi\"""#);
+        assert_eq!(quote(r"a\b").unwrap(), r#""a\\b""#);
+    }
+
+    #[test]
+    fn quote_rejects_line_breaks() {
+        assert!(quote("a\r\nDELETE INBOX").is_err());
+        assert!(quote("a\nb").is_err());
+    }
 }

@@ -59,6 +59,8 @@ pub fn http_client() -> anyhow::Result<reqwest::Client> {
         .collect::<Result<Vec<_>, _>>()?;
     Ok(reqwest::Client::builder()
         .tls_certs_only(certs)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?)
 }
 

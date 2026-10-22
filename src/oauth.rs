@@ -129,9 +129,12 @@ impl PendingLogin {
                 .accept()
                 .await?;
             let mut buf = vec![0u8; 8192];
-            let n = sock
-                .read(&mut buf)
-                .await?;
+            // A connection that never sends its request must not block the real redirect.
+            let Ok(read) = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await
+            else {
+                continue;
+            };
+            let n = read?;
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req
                 .lines()

@@ -1073,7 +1073,7 @@ impl EmailServer {
                     .filter(|p| !p.is_empty())
                     .ok_or("password is required for this account")?;
                 // Verify before storing so a typo doesn't replace a working password.
-                let mut session = imap::connect(&account, &imap::Credential::Password(pw.clone()))
+                let session = imap::connect(&account, &imap::Credential::Password(pw.clone()))
                     .await
                     .map_err(|e| {
                         let hint = match account.provider {
@@ -1083,9 +1083,7 @@ impl EmailServer {
                         };
                         format!("{e:#}{hint}")
                     })?;
-                let _ = session
-                    .logout()
-                    .await;
+                imap::logout(session).await;
                 secrets::set(store, &account.id, SecretKind::Password, pw)
                     .await
                     .map_err(fail)?;

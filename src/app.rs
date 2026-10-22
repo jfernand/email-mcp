@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::timeout;
 
 use crate::config::{Account, AuthMethod, Config};
 use crate::imap::{self, Credential, Pool, Session};
@@ -151,13 +152,12 @@ impl App {
             .await;
 
         let alive = match guard.as_mut() {
-            Some(s) => s
-                .noop()
-                .await
-                .is_ok(),
+            Some(s) => matches!(timeout(imap::COMMAND_TIMEOUT, s.noop()).await, Ok(Ok(_))),
             None => false,
         };
         if !alive {
+            // A stalled session is simply dropped; logging out of it could stall too.
+            guard.take();
             let cred = self
                 .credential(account)
                 .await?;
@@ -165,21 +165,35 @@ impl App {
         }
         let session = guard
             .as_mut()
-            .unwrap();
-        if let Some(mb) = mailbox
-            && let Err(e) = session
-                .select(mb)
-                .await
-        {
-            bail!("could not open mailbox '{mb}': {e}");
+            .expect("session was just checked or opened");
+        if let Some(mb) = mailbox {
+            match timeout(imap::COMMAND_TIMEOUT, session.select(mb)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => bail!("could not open mailbox '{mb}': {e}"),
+                Err(_) => {
+                    guard.take();
+                    bail!(
+                        "the server did not respond within {}s while opening mailbox '{mb}'; the connection was reset",
+                        imap::COMMAND_TIMEOUT.as_secs()
+                    );
+                }
+            }
         }
-        let result = f(session).await;
+        let result = match timeout(imap::CALL_TIMEOUT, f(session)).await {
+            Ok(r) => r,
+            Err(_) => {
+                guard.take();
+                bail!(
+                    "the server did not respond within {}s and the connection was reset; \
+                     the operation may or may not have taken effect, so check before retrying",
+                    imap::CALL_TIMEOUT.as_secs()
+                );
+            }
+        };
         if result.is_err() {
             // The connection may be in an unknown state after an error; start fresh next time.
-            if let Some(mut s) = guard.take() {
-                let _ = s
-                    .logout()
-                    .await;
+            if let Some(s) = guard.take() {
+                imap::logout(s).await;
             }
         }
         result
