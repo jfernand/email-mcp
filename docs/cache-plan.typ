@@ -75,7 +75,7 @@ if it fails for good.
   ([1], [2026-10-21], [First draft: one store; yabiir gains atomic batches, ordered keydir and per-record compression (format v2).]),
   ([2], [2026-10-22], [Two stores (cache, queue). New #cd[yabiir-tables] crate with tables, key encoding and per-table codecs. yabiir keeps only the ordered keydir. Batches dropped in favour of write ordering; compression moved to the table layer. Tables identified in keys by numeric ids from the catalog.]),
   ([3], [2026-10-22], [#cd[messages] split into #cd[envelopes] (immutable, parsed and decoded fields) and #cd[flags] (mutable); the summary fetch grows to cover them. Bodies stay raw, with an optional derived #cd[text] table and an optional body-cache size cap. Note that secondary indexes may be needed later.]),
-  ([4], [2026-10-22], [#cd[done] means confirmed by the server and verified by read-back. Worker gains per-command timeouts, a verify step, and verify-before-retry when an outcome is unknown. The ordered keydir becomes yabiir's only keydir. JSON for envelopes, postcard for flags confirmed. Freshness fixed at 60 s for all mailboxes; body-cache cap deferred. #cd[text] table in v1, with the local / server / partial rule for body search.]),
+  ([4], [2026-10-22], [#cd[done] means confirmed by the server and verified by read-back. Worker gains per-command timeouts, a verify step, and verify-before-retry when an outcome is unknown. The ordered keydir becomes yabiir's only keydir. JSON for envelopes, postcard for flags confirmed. Freshness fixed at 60 s for all mailboxes; body-cache cap deferred. #cd[text] table in v1, with the local / server / partial rule for body search. Phasing expanded into numbered, testable steps.]),
 )
 
 == What exists today
@@ -570,11 +570,79 @@ with injected failures and simulated crashes.
 
 == Phasing
 
-+ #key[yabiir 0.6.0] — ordered keydir and scans; publish.
-+ #key[yabiir-tables 0.1.0] — Db, tables, key encoding, codecs, catalog; publish.
-+ #key[Read cache] — cache store, sync, cached read tools, #cd[cache_status], #cd[sync_mailbox].
-+ #key[Queue] — queue store, worker, replay, the mutating tools, #cd[pending_commands] / #cd[retry_command] / #cd[discard_command].
-+ #key[Polish] — background INBOX sync, merge scheduling, README and #cd[--describe] review.
+Each step can be built and tested on its own and depends only on earlier steps. Steps 2.1,
+2.2, 3.1, 3.2 and 3.3 do not need the new yabiir and can start at once; 3.2 also improves
+today's uncached tools.
+
+#callout(kind: "info", "Critical path")[
+  1.1–1.4 → 2.3–2.5 → 3.3 → Phase 4 → Phase 5.
+]
+
+#key[Phase 1 — yabiir 0.6.0 (ordered keydir)]
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Step", "Work and exit criterion"),
+  ([1.1], [Baseline benchmarks of #cd[get], #cd[insert] and the keydir rebuild at open on the current hash map, before changing anything.]),
+  ([1.2], [Replace the keydir with a #cd[BTreeMap] and drop #cd[ahash]. All existing tests pass\; benchmarks re-run and the slowdown written into the changelog.]),
+  ([1.3], [#cd[scan] / #cd[scan_keys] with bounds, reverse, limit and a prefix helper, on #cd[Engine] and the #cd[Bitcask] trait. Range captured under the read lock without I/O. Proptest model checks every scan against a reference #cd[BTreeMap].]),
+  ([1.4], [README and ROADMAP updated\; publish 0.6.0.]),
+)
+
+#key[Phase 2 — yabiir-tables 0.1.0]
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Step", "Work and exit criterion"),
+  ([2.1], [Crate skeleton and the #cd[Key] encoding: integers, escaped strings and byte strings, tuples, #cd[KeyPrefix] and #cd[prefix!]. Property tests: encoded order equals logical order, decoding round-trips. Pure code — can run alongside Phase 1.]),
+  ([2.2], [Value codecs: header byte, JSON / postcard / raw, lz4 above a minimum size. Tests for round-trips, incompressible values, and corrupt input returning an error, not a panic.]),
+  ([2.3], [#cd[Db] and the catalog: open, #cd[u16] table ids never reused, #cd[SchemaMismatch], #cd[drop_table].]),
+  ([2.4], [The #cd[Table] API: #cd[get], #cd[put], #cd[delete], #cd[range] / #cd[prefix] with #cd[.reverse()] and #cd[.limit()], #cd[delete_prefix], #cd[clear]. Table-isolation tests.]),
+  ([2.5], [Inspection CLI (#cd[tables], #cd[dump TABLE])\; publish 0.1.0.]),
+)
+
+#key[Phase 3 — email-mcp groundwork (no change in behaviour)]
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Step", "Work and exit criterion"),
+  ([3.1], [#cd[MailServer] trait over the #cd[imap.rs] operations sync and the worker need\; real implementation plus an in-memory fake that can inject failures.]),
+  ([3.2], [Expanded summary fetch parsed into #cd[Envelope] and #cd[FlagState]: decoded subjects, parsed addresses, attachment count, Gmail ids. Parsing tests.]),
+  ([3.3], [#cd[CacheDb] / #cd[QueueDb] on #cd[spawn_blocking]: directories and 0700/0600 permissions, table definitions, #cd[[cache]] config, #cd[App] fields, uncached fallback when another process holds the lock.]),
+)
+
+#key[Phase 4 — read cache (ships as email-mcp 0.2.0)]
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Step", "Work and exit criterion"),
+  ([4.1], [Sync: select, UIDVALIDITY check, new mail newest-first, #cd[CHANGEDSINCE] flags, expunges by UID diff, checkpoint written last. Tested against the fake, including a crash mid-sync.]),
+  ([4.2], [Cached reads: #cd[list_mailboxes], #cd[list_messages], #cd[read_message] (first read stores body and text), #cd[refresh], 60 s freshness, #cd[sync_mailbox] and #cd[cache_status].]),
+  ([4.3], [Local search: header, flag and date scans\; body-text search with the local / server / partial rule.]),
+  ([4.4], [Background INBOX sync every 5 minutes, hourly merge\; manual test on me.com.]),
+)
+
+#key[Phase 5 — command queue (ships as email-mcp 0.3.0)]
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Step", "Work and exit criterion"),
+  ([5.1], [#cd[Command] / #cd[Op], queue store, idempotent #cd[apply_local] per op, replay at startup and during sync. Tests: applying twice is harmless, sync never resurrects deleted mail, a crash between enqueue and apply is repaired.]),
+  ([5.2], [Worker: FIFO per account, #cd[InFlight], 30 s timeouts, read-back verification, verify before retry, backoff, permanent failure → #cd[Failed] + resync.]),
+  ([5.3], [Mutating tools enqueue, wait up to 5 s and report #cd[done] / #cd[failed] / #cd[queued]\; Sent copy via #cd[Append]\; #cd[remove_account] cleanup order.]),
+  ([5.4], [#cd[pending_commands], #cd[retry_command], #cd[discard_command]\; server instructions: never report a queued change as done.]),
+  ([5.5], [Manual tests on me.com: a real delete, the network off, the cache directory deleted while commands are queued.]),
+)
+
+#key[Phase 6 — polish]
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Step", "Work"),
+  ([6.1], [README: cache location, plaintext-at-rest note, backup caveat.]),
+  ([6.2], [Review the #cd[--describe] output.]),
+  ([6.3], [Clean up data left under old UIDVALIDITY values.]),
+)
 
 == Future work
 
