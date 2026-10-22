@@ -20,15 +20,23 @@ const USAGE: &str = "usage: email-mcp               serve MCP over stdio
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .collect();
+    let args: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .collect();
     match args.as_slice() {
         [] => {}
         ["--describe"] | ["--describe", "--json"] | ["--json", "--describe"] => {
             // No config or network needed: the tool list is static.
             let server = server::EmailServer::new(Arc::new(app::App::default()));
             if args.contains(&"--json") {
-                println!("{}", serde_json::to_string_pretty(&describe::json(&server))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&describe::json(&server))?
+                );
             } else {
                 print!("{}", describe::text(&server));
             }
@@ -56,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
     let service = server::EmailServer::new(app)
         .serve(rmcp::transport::stdio_pipes())
         .await?;
-    service.waiting().await?;
+    service
+        .waiting()
+        .await?;
     Ok(())
 }

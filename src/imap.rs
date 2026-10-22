@@ -28,16 +28,22 @@ struct XOauth2(String);
 impl async_imap::Authenticator for &XOauth2 {
     type Response = String;
     fn process(&mut self, _challenge: &[u8]) -> Self::Response {
-        self.0.clone()
+        self.0
+            .clone()
     }
 }
 
 pub async fn connect(account: &Account, cred: &Credential) -> Result<Session> {
-    let host = account.imap_host.as_str();
-    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, account.imap_port)))
-        .await
-        .map_err(|_| anyhow!("timed out connecting to {host}"))?
-        .with_context(|| format!("connecting to {host}:{}", account.imap_port))?;
+    let host = account
+        .imap_host
+        .as_str();
+    let tcp = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((host, account.imap_port)),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out connecting to {host}"))?
+    .with_context(|| format!("connecting to {host}:{}", account.imap_port))?;
     let tls = TlsConnector::from(crate::tls::client_config())
         .connect(ServerName::try_from(host.to_owned())?, tcp)
         .await
@@ -83,10 +89,19 @@ impl Pool {
     }
 
     pub async fn drop_session(&self, account_id: &str) {
-        if let Some(slot) = self.sessions.lock().await.remove(account_id)
-            && let Some(mut s) = slot.lock().await.take()
+        if let Some(slot) = self
+            .sessions
+            .lock()
+            .await
+            .remove(account_id)
+            && let Some(mut s) = slot
+                .lock()
+                .await
+                .take()
         {
-            let _ = s.logout().await;
+            let _ = s
+                .logout()
+                .await;
         }
     }
 }
@@ -110,7 +125,11 @@ pub struct MailboxInfo {
 }
 
 pub async fn list_mailboxes(s: &mut Session) -> Result<Vec<MailboxInfo>> {
-    let names: Vec<_> = s.list(Some(""), Some("*")).await?.try_collect().await?;
+    let names: Vec<_> = s
+        .list(Some(""), Some("*"))
+        .await?
+        .try_collect()
+        .await?;
     Ok(names
         .iter()
         .map(|n| {
@@ -129,7 +148,9 @@ pub async fn list_mailboxes(s: &mut Session) -> Result<Vec<MailboxInfo>> {
                 }
             }
             MailboxInfo {
-                name: n.name().to_owned(),
+                name: n
+                    .name()
+                    .to_owned(),
                 special,
                 selectable,
             }
@@ -141,21 +162,41 @@ pub async fn list_mailboxes(s: &mut Session) -> Result<Vec<MailboxInfo>> {
 /// that don't advertise SPECIAL-USE attributes.
 pub async fn find_special(s: &mut Session, kind: SpecialUse) -> Result<String> {
     let boxes = list_mailboxes(s).await?;
-    if let Some(b) = boxes.iter().find(|b| b.special == Some(kind)) {
-        return Ok(b.name.clone());
+    if let Some(b) = boxes
+        .iter()
+        .find(|b| b.special == Some(kind))
+    {
+        return Ok(b
+            .name
+            .clone());
     }
     let candidates: &[&str] = match kind {
         SpecialUse::Sent => &["Sent Messages", "Sent", "[Gmail]/Sent Mail", "Sent Items"],
         SpecialUse::Drafts => &["Drafts", "[Gmail]/Drafts"],
-        SpecialUse::Trash => &["Deleted Messages", "Trash", "[Gmail]/Trash", "Deleted Items"],
+        SpecialUse::Trash => &[
+            "Deleted Messages",
+            "Trash",
+            "[Gmail]/Trash",
+            "Deleted Items",
+        ],
         SpecialUse::Junk => &["Junk", "Spam", "[Gmail]/Spam"],
         SpecialUse::Archive => &["Archive"],
         SpecialUse::All => &["[Gmail]/All Mail"],
     };
     candidates
         .iter()
-        .find_map(|c| boxes.iter().find(|b| b.name.eq_ignore_ascii_case(c)))
-        .map(|b| b.name.clone())
+        .find_map(|c| {
+            boxes
+                .iter()
+                .find(|b| {
+                    b.name
+                        .eq_ignore_ascii_case(c)
+                })
+        })
+        .map(|b| {
+            b.name
+                .clone()
+        })
         .ok_or_else(|| anyhow!("could not find a {kind:?} mailbox on this account"))
 }
 
@@ -182,16 +223,23 @@ pub fn flag_name(f: &Flag) -> String {
     }
 }
 
-const SUMMARY_QUERY: &str =
-    "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID)])";
+const SUMMARY_QUERY: &str = "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID)])";
 
 fn to_summary(f: &Fetch) -> Option<Summary> {
     Some(Summary {
         uid: f.uid?,
-        flags: f.flags().map(|fl| flag_name(&fl)).collect(),
+        flags: f
+            .flags()
+            .map(|fl| flag_name(&fl))
+            .collect(),
         size: f.size,
-        internal_date: f.internal_date().map(|d| d.to_rfc3339()),
-        headers: f.header().unwrap_or_default().to_vec(),
+        internal_date: f
+            .internal_date()
+            .map(|d| d.to_rfc3339()),
+        headers: f
+            .header()
+            .unwrap_or_default()
+            .to_vec(),
     })
 }
 
@@ -205,14 +253,21 @@ pub async fn fetch_summaries(s: &mut Session, uids: &[u32]) -> Result<Vec<Summar
         .await?
         .try_collect()
         .await?;
-    let mut out: Vec<_> = fetches.iter().filter_map(to_summary).collect();
+    let mut out: Vec<_> = fetches
+        .iter()
+        .filter_map(to_summary)
+        .collect();
     out.sort_by_key(|s| std::cmp::Reverse(s.uid));
     Ok(out)
 }
 
 /// UIDs matching `query` in the currently selected mailbox, newest first.
 pub async fn search(s: &mut Session, query: &str) -> Result<Vec<u32>> {
-    let mut uids: Vec<u32> = s.uid_search(query).await?.into_iter().collect();
+    let mut uids: Vec<u32> = s
+        .uid_search(query)
+        .await?
+        .into_iter()
+        .collect();
     uids.sort_unstable_by(|a, b| b.cmp(a));
     Ok(uids)
 }
@@ -231,11 +286,19 @@ pub async fn fetch_raw(s: &mut Session, uid: u32) -> Result<(Vec<u8>, Vec<String
         .body()
         .ok_or_else(|| anyhow!("server returned no body for UID {uid}"))?
         .to_vec();
-    Ok((body, f.flags().map(|fl| flag_name(&fl)).collect()))
+    Ok((
+        body,
+        f.flags()
+            .map(|fl| flag_name(&fl))
+            .collect(),
+    ))
 }
 
 pub fn uid_set(uids: &[u32]) -> String {
-    uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+    uids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub async fn store_flags(s: &mut Session, uids: &[u32], op: &str, flags: &[String]) -> Result<()> {
@@ -243,16 +306,24 @@ pub async fn store_flags(s: &mut Session, uids: &[u32], op: &str, flags: &[Strin
         return Ok(());
     }
     let q = format!("{op}FLAGS.SILENT ({})", flags.join(" "));
-    let _: Vec<Fetch> = s.uid_store(uid_set(uids), q).await?.try_collect().await?;
+    let _: Vec<Fetch> = s
+        .uid_store(uid_set(uids), q)
+        .await?
+        .try_collect()
+        .await?;
     Ok(())
 }
 
 pub async fn move_messages(s: &mut Session, uids: &[u32], to: &str) -> Result<()> {
-    let caps = s.capabilities().await?;
+    let caps = s
+        .capabilities()
+        .await?;
     if caps.has_str("MOVE") {
-        s.uid_mv(uid_set(uids), to).await?;
+        s.uid_mv(uid_set(uids), to)
+            .await?;
     } else {
-        s.uid_copy(uid_set(uids), to).await?;
+        s.uid_copy(uid_set(uids), to)
+            .await?;
         store_flags(s, uids, "+", &["\\Deleted".into()]).await?;
         expunge_uids(s, uids).await?;
     }
@@ -260,11 +331,21 @@ pub async fn move_messages(s: &mut Session, uids: &[u32], to: &str) -> Result<()
 }
 
 pub async fn expunge_uids(s: &mut Session, uids: &[u32]) -> Result<()> {
-    let caps = s.capabilities().await?;
+    let caps = s
+        .capabilities()
+        .await?;
     if caps.has_str("UIDPLUS") {
-        let _: Vec<_> = s.uid_expunge(uid_set(uids)).await?.try_collect().await?;
+        let _: Vec<_> = s
+            .uid_expunge(uid_set(uids))
+            .await?
+            .try_collect()
+            .await?;
     } else {
-        let _: Vec<_> = s.expunge().await?.try_collect().await?;
+        let _: Vec<_> = s
+            .expunge()
+            .await?
+            .try_collect()
+            .await?;
     }
     Ok(())
 }
@@ -274,5 +355,9 @@ pub fn quote(s: &str) -> Result<String> {
     if s.contains(['\r', '\n']) {
         bail!("search terms cannot contain line breaks");
     }
-    Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+    Ok(format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    ))
 }

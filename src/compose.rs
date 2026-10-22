@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
+use lettre::Message;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment as LettreAttachment, Mailbox, MultiPart, SinglePart};
-use lettre::Message;
 use mail_parser::{Address, MimeHeaders};
 
 use crate::config::Account;
@@ -19,7 +19,10 @@ impl Attachment {
         let data = std::fs::read(p).with_context(|| format!("reading attachment {path}"))?;
         let filename = p
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|n| {
+                n.to_string_lossy()
+                    .into_owned()
+            })
             .unwrap_or_else(|| "attachment".into());
         Ok(Self {
             content_type: guess_mime(&filename).into(),
@@ -30,7 +33,11 @@ impl Attachment {
 }
 
 fn guess_mime(name: &str) -> &'static str {
-    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "pdf" => "application/pdf",
         "png" => "image/png",
@@ -73,7 +80,12 @@ pub fn sender(account: &Account) -> Result<Mailbox> {
         .email
         .parse()
         .with_context(|| format!("invalid account email {}", account.email))?;
-    Ok(Mailbox::new(account.display_name.clone(), addr))
+    Ok(Mailbox::new(
+        account
+            .display_name
+            .clone(),
+        addr,
+    ))
 }
 
 fn parse_mailbox(s: &str) -> Result<Mailbox> {
@@ -84,7 +96,9 @@ fn parse_mailbox(s: &str) -> Result<Mailbox> {
 
 /// Build the message. `keep_bcc` retains the Bcc header (needed for drafts).
 pub fn build(account: &Account, c: &Compose, keep_bcc: bool) -> Result<Message> {
-    let mut b = Message::builder().from(sender(account)?).subject(&c.subject);
+    let mut b = Message::builder()
+        .from(sender(account)?)
+        .subject(&c.subject);
     for a in &c.to {
         b = b.to(parse_mailbox(a)?);
     }
@@ -100,23 +114,45 @@ pub fn build(account: &Account, c: &Compose, keep_bcc: bool) -> Result<Message> 
     if let Some(id) = &c.in_reply_to {
         b = b.in_reply_to(id.clone());
     }
-    if !c.references.is_empty() {
-        b = b.references(c.references.join(" "));
+    if !c
+        .references
+        .is_empty()
+    {
+        b = b.references(
+            c.references
+                .join(" "),
+        );
     }
 
-    let text = c.text.clone().unwrap_or_default();
+    let text = c
+        .text
+        .clone()
+        .unwrap_or_default();
     let body = match &c.html {
         Some(html) => MultiPart::alternative_plain_html(text, html.clone()),
         None => MultiPart::mixed().singlepart(SinglePart::plain(text)),
     };
-    let body = if c.attachments.is_empty() {
+    let body = if c
+        .attachments
+        .is_empty()
+    {
         body
     } else {
         let mut mixed = MultiPart::mixed().multipart(body);
         for a in &c.attachments {
             let ct = ContentType::parse(&a.content_type)
                 .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
-            mixed = mixed.singlepart(LettreAttachment::new(a.filename.clone()).body(a.data.clone(), ct));
+            mixed = mixed.singlepart(
+                LettreAttachment::new(
+                    a.filename
+                        .clone(),
+                )
+                .body(
+                    a.data
+                        .clone(),
+                    ct,
+                ),
+            );
         }
         mixed
     };
@@ -149,7 +185,10 @@ fn bare_email(s: &str) -> String {
 }
 
 fn dedupe_excluding(list: Vec<String>, exclude: &[String]) -> Vec<String> {
-    let mut seen: Vec<String> = exclude.iter().map(|e| bare_email(e)).collect();
+    let mut seen: Vec<String> = exclude
+        .iter()
+        .map(|e| bare_email(e))
+        .collect();
     list.into_iter()
         .filter(|a| {
             let e = bare_email(a);
@@ -164,7 +203,9 @@ fn dedupe_excluding(list: Vec<String>, exclude: &[String]) -> Vec<String> {
 }
 
 fn prefixed(prefix: &str, subject: &str) -> String {
-    let lower = subject.trim_start().to_ascii_lowercase();
+    let lower = subject
+        .trim_start()
+        .to_ascii_lowercase();
     if lower.starts_with(&format!("{}:", prefix.to_ascii_lowercase())) {
         subject.to_owned()
     } else {
@@ -188,13 +229,23 @@ pub fn html_to_text(html: &str) -> String {
 fn references_of(msg: &mail_parser::Message) -> Vec<String> {
     msg.references()
         .as_text_list()
-        .map(|l| l.iter().map(|r| format!("<{r}>")).collect())
-        .or_else(|| msg.references().as_text().map(|r| vec![format!("<{r}>")]))
+        .map(|l| {
+            l.iter()
+                .map(|r| format!("<{r}>"))
+                .collect()
+        })
+        .or_else(|| {
+            msg.references()
+                .as_text()
+                .map(|r| vec![format!("<{r}>")])
+        })
         .unwrap_or_default()
 }
 
 fn reference_chain(orig: &mail_parser::Message) -> (Option<String>, Vec<String>) {
-    let id = orig.message_id().map(|i| format!("<{i}>"));
+    let id = orig
+        .message_id()
+        .map(|i| format!("<{i}>"));
     let mut refs = references_of(orig);
     if let Some(i) = &id {
         refs.push(i.clone());
@@ -217,15 +268,26 @@ pub fn reply(
     html: Option<String>,
     reply_all: bool,
 ) -> Compose {
-    let me = vec![account.email.clone()];
+    let me = vec![
+        account
+            .email
+            .clone(),
+    ];
     let to = {
         let rt = addresses(orig.reply_to());
-        if rt.is_empty() { addresses(orig.from()) } else { rt }
+        if rt.is_empty() {
+            addresses(orig.from())
+        } else {
+            rt
+        }
     };
     let (to, cc) = if reply_all {
         let to = dedupe_excluding(to, &me);
         let mut exclude = me.clone();
-        exclude.extend(to.iter().cloned());
+        exclude.extend(
+            to.iter()
+                .cloned(),
+        );
         let mut others = addresses(orig.to());
         others.extend(addresses(orig.cc()));
         (to, dedupe_excluding(others, &exclude))
@@ -241,7 +303,11 @@ pub fn reply(
     Compose {
         to,
         cc,
-        subject: prefixed("Re", orig.subject().unwrap_or("")),
+        subject: prefixed(
+            "Re",
+            orig.subject()
+                .unwrap_or(""),
+        ),
         text: Some(format!("{body}\n\n{}\n{quoted}", attribution(orig))),
         html,
         in_reply_to,
@@ -250,23 +316,43 @@ pub fn reply(
     }
 }
 
-pub fn forward(orig: &mail_parser::Message, to: Vec<String>, body: &str, include_attachments: bool) -> Compose {
+pub fn forward(
+    orig: &mail_parser::Message,
+    to: Vec<String>,
+    body: &str,
+    include_attachments: bool,
+) -> Compose {
     let header = format!(
         "---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}\n{}",
         addresses(orig.from()).join(", "),
-        orig.date().map(|d| d.to_rfc822()).unwrap_or_default(),
-        orig.subject().unwrap_or(""),
+        orig.date()
+            .map(|d| d.to_rfc822())
+            .unwrap_or_default(),
+        orig.subject()
+            .unwrap_or(""),
         addresses(orig.to()).join(", "),
         {
             let cc = addresses(orig.cc());
-            if cc.is_empty() { String::new() } else { format!("Cc: {}\n", cc.join(", ")) }
+            if cc.is_empty() {
+                String::new()
+            } else {
+                format!("Cc: {}\n", cc.join(", "))
+            }
         }
     );
-    let attachments = if include_attachments { attachments_of(orig) } else { vec![] };
+    let attachments = if include_attachments {
+        attachments_of(orig)
+    } else {
+        vec![]
+    };
     let (_, references) = reference_chain(orig);
     Compose {
         to,
-        subject: prefixed("Fwd", orig.subject().unwrap_or("")),
+        subject: prefixed(
+            "Fwd",
+            orig.subject()
+                .unwrap_or(""),
+        ),
         text: Some(format!("{body}\n\n{header}\n{}", best_text(orig))),
         attachments,
         references,
@@ -286,10 +372,14 @@ pub fn attachments_of(msg: &mail_parser::Message) -> Vec<Attachment> {
                 .content_type()
                 .map(|ct| match ct.subtype() {
                     Some(st) => format!("{}/{st}", ct.ctype()),
-                    None => ct.ctype().to_owned(),
+                    None => ct
+                        .ctype()
+                        .to_owned(),
                 })
                 .unwrap_or_else(|| "application/octet-stream".into()),
-            data: p.contents().to_vec(),
+            data: p
+                .contents()
+                .to_vec(),
         })
         .collect()
 }
@@ -303,11 +393,24 @@ pub fn from_draft(msg: &mail_parser::Message) -> Compose {
         to: addresses(msg.to()),
         cc: addresses(msg.cc()),
         bcc: addresses(msg.bcc()),
-        subject: msg.subject().unwrap_or("").to_owned(),
-        text: msg.body_text(0).map(|t| t.into_owned()),
-        html: if has_html { msg.body_html(0).map(|h| h.into_owned()) } else { None },
+        subject: msg
+            .subject()
+            .unwrap_or("")
+            .to_owned(),
+        text: msg
+            .body_text(0)
+            .map(|t| t.into_owned()),
+        html: if has_html {
+            msg.body_html(0)
+                .map(|h| h.into_owned())
+        } else {
+            None
+        },
         attachments: attachments_of(msg),
-        in_reply_to: msg.in_reply_to().as_text().map(|i| format!("<{i}>")),
+        in_reply_to: msg
+            .in_reply_to()
+            .as_text()
+            .map(|i| format!("<{i}>")),
         references: references_of(msg),
     }
 }
@@ -348,26 +451,38 @@ References: <msg1@example.com>\r\n\
 Tomorrow?\r\nAt noon.\r\n";
 
     fn emails(list: &[String]) -> Vec<String> {
-        list.iter().map(|a| bare_email(a)).collect()
+        list.iter()
+            .map(|a| bare_email(a))
+            .collect()
     }
 
     #[test]
     fn reply_goes_to_sender_and_threads() {
-        let orig = MessageParser::default().parse(ORIGINAL).unwrap();
+        let orig = MessageParser::default()
+            .parse(ORIGINAL)
+            .unwrap();
         let c = reply(&account(), &orig, "Sure", None, false);
         assert_eq!(emails(&c.to), ["bob@example.com"]);
         assert!(c.cc.is_empty());
         assert_eq!(c.subject, "Re: Lunch");
-        assert_eq!(c.in_reply_to.as_deref(), Some("<msg2@example.com>"));
+        assert_eq!(
+            c.in_reply_to
+                .as_deref(),
+            Some("<msg2@example.com>")
+        );
         assert_eq!(c.references, ["<msg1@example.com>", "<msg2@example.com>"]);
-        let text = c.text.unwrap();
+        let text = c
+            .text
+            .unwrap();
         assert!(text.starts_with("Sure\n"));
         assert!(text.contains("> Tomorrow?\n> At noon."));
     }
 
     #[test]
     fn reply_all_excludes_self_and_duplicates() {
-        let orig = MessageParser::default().parse(ORIGINAL).unwrap();
+        let orig = MessageParser::default()
+            .parse(ORIGINAL)
+            .unwrap();
         let c = reply(&account(), &orig, "Sure", None, true);
         assert_eq!(emails(&c.to), ["bob@example.com"]);
         // Me (case-insensitively) and Bob (already in To) are dropped from Cc.
@@ -387,11 +502,22 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=XX\r\n\r\n\
 --XX\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n\
 --XX\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=r.pdf\r\n\
 Content-Transfer-Encoding: base64\r\n\r\nJVBERg==\r\n--XX--\r\n";
-        let orig = MessageParser::default().parse(&raw[..]).unwrap();
+        let orig = MessageParser::default()
+            .parse(&raw[..])
+            .unwrap();
         let c = forward(&orig, vec!["eve@example.com".into()], "FYI", true);
         assert_eq!(c.subject, "Fwd: Report");
-        assert!(c.text.as_ref().unwrap().contains("See attached."));
-        assert_eq!(c.attachments.len(), 1);
+        assert!(
+            c.text
+                .as_ref()
+                .unwrap()
+                .contains("See attached.")
+        );
+        assert_eq!(
+            c.attachments
+                .len(),
+            1
+        );
         assert_eq!(c.attachments[0].filename, "r.pdf");
         assert_eq!(c.attachments[0].data, b"%PDF");
     }
@@ -412,16 +538,33 @@ Content-Transfer-Encoding: base64\r\n\r\nJVBERg==\r\n--XX--\r\n";
             }],
             ..Default::default()
         };
-        let raw = build(&account(), &c, true).unwrap().formatted();
-        let parsed = MessageParser::default().parse(&raw).unwrap();
+        let raw = build(&account(), &c, true)
+            .unwrap()
+            .formatted();
+        let parsed = MessageParser::default()
+            .parse(&raw)
+            .unwrap();
         let back = from_draft(&parsed);
         assert_eq!(emails(&back.to), ["bob@example.com"]);
         assert_eq!(emails(&back.bcc), ["secret@example.com"]);
         assert_eq!(back.subject, "Hi");
-        assert_eq!(back.text.as_deref().map(str::trim), Some("Body"));
+        assert_eq!(
+            back.text
+                .as_deref()
+                .map(str::trim),
+            Some("Body")
+        );
         assert_eq!(back.html, None);
-        assert_eq!(back.in_reply_to.as_deref(), Some("<m1@example.com>"));
-        assert_eq!(back.attachments.len(), 1);
+        assert_eq!(
+            back.in_reply_to
+                .as_deref(),
+            Some("<m1@example.com>")
+        );
+        assert_eq!(
+            back.attachments
+                .len(),
+            1
+        );
         assert_eq!(back.attachments[0].data, b"hello");
     }
 
@@ -438,6 +581,11 @@ Content-Transfer-Encoding: base64\r\n\r\nJVBERg==\r\n--XX--\r\n";
         let raw = String::from_utf8(msg.formatted()).unwrap();
         assert!(!raw.contains("secret@example.com"));
         // ...but the envelope still delivers to the Bcc recipient.
-        assert!(msg.envelope().to().iter().any(|a| a.to_string() == "secret@example.com"));
+        assert!(
+            msg.envelope()
+                .to()
+                .iter()
+                .any(|a| a.to_string() == "secret@example.com")
+        );
     }
 }

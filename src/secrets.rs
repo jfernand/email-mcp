@@ -39,7 +39,12 @@ pub async fn get(store: SecretStore, account_id: &str, kind: SecretKind) -> Resu
     .await
 }
 
-pub async fn set(store: SecretStore, account_id: &str, kind: SecretKind, value: String) -> Result<()> {
+pub async fn set(
+    store: SecretStore,
+    account_id: &str,
+    kind: SecretKind,
+    value: String,
+) -> Result<()> {
     let key = key(account_id, kind);
     run_blocking(move || match store {
         SecretStore::Keyring => keyring::Entry::new(SERVICE, &key)?
@@ -63,7 +68,10 @@ pub async fn delete(store: SecretStore, account_id: &str, kind: SecretKind) -> R
         },
         SecretStore::File => {
             let mut map = read_file()?;
-            if map.remove(&key).is_some() {
+            if map
+                .remove(&key)
+                .is_some()
+            {
                 write_file(&map)?;
             }
             Ok(())
@@ -102,10 +110,15 @@ fn write_file(map: &BTreeMap<String, String>) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let path = file_path()?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::create_dir_all(
+        path.parent()
+            .unwrap(),
+    )?;
     let tmp = path.with_extension("json.tmp");
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true)
+        .create(true)
+        .truncate(true);
     #[cfg(unix)]
     opts.mode(0o600);
     let mut f = opts.open(&tmp)?;

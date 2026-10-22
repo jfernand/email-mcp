@@ -76,7 +76,9 @@ pub struct Account {
 
 impl Account {
     pub fn username(&self) -> &str {
-        self.username.as_deref().unwrap_or(&self.email)
+        self.username
+            .as_deref()
+            .unwrap_or(&self.email)
     }
 }
 
@@ -114,7 +116,9 @@ pub fn config_dir() -> Result<PathBuf> {
     }
     let dirs = directories::ProjectDirs::from("", "", "email-mcp")
         .ok_or_else(|| anyhow!("could not determine a config directory"))?;
-    Ok(dirs.config_dir().to_path_buf())
+    Ok(dirs
+        .config_dir()
+        .to_path_buf())
 }
 
 impl Config {
@@ -133,7 +137,10 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::create_dir_all(
+            path.parent()
+                .unwrap(),
+        )?;
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
         std::fs::rename(&tmp, &path)?;
@@ -150,17 +157,34 @@ impl Config {
             Some(k) => self
                 .accounts
                 .iter()
-                .find(|a| a.id.eq_ignore_ascii_case(k) || a.email.eq_ignore_ascii_case(k))
+                .find(|a| {
+                    a.id.eq_ignore_ascii_case(k)
+                        || a.email
+                            .eq_ignore_ascii_case(k)
+                })
                 .ok_or_else(|| {
-                    let known: Vec<_> = self.accounts.iter().map(|a| a.id.as_str()).collect();
+                    let known: Vec<_> = self
+                        .accounts
+                        .iter()
+                        .map(|a| {
+                            a.id.as_str()
+                        })
+                        .collect();
                     anyhow!("unknown account '{k}' (known: {})", known.join(", "))
                 }),
         }
     }
 
     pub fn index_of(&self, key: &str) -> Result<usize> {
-        let id = self.find(Some(key))?.id.clone();
-        Ok(self.accounts.iter().position(|a| a.id == id).unwrap())
+        let id = self
+            .find(Some(key))?
+            .id
+            .clone();
+        Ok(self
+            .accounts
+            .iter()
+            .position(|a| a.id == id)
+            .unwrap())
     }
 }
 
@@ -201,7 +225,11 @@ pub fn provider_defaults(provider: Provider) -> Option<ProviderDefaults> {
 
 /// Guess the provider from an email domain.
 pub fn guess_provider(email: &str) -> Provider {
-    let domain = email.rsplit('@').next().unwrap_or("").to_ascii_lowercase();
+    let domain = email
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match domain.as_str() {
         "me.com" | "mac.com" | "icloud.com" => Provider::Icloud,
         "gmail.com" | "googlemail.com" => Provider::Gmail,
@@ -246,6 +274,10 @@ mod tests {
         assert_eq!(a.remove_by, RemoveBy::MoveToTrash);
         assert_eq!(a.trash_mailbox, None);
         // Unset trash_mailbox is not written back.
-        assert!(!toml::to_string(&cfg).unwrap().contains("trash_mailbox"));
+        assert!(
+            !toml::to_string(&cfg)
+                .unwrap()
+                .contains("trash_mailbox")
+        );
     }
 }

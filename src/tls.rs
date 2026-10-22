@@ -17,7 +17,10 @@ const DISTRUSTED_ISSUERS: &[&[u8]] = &[b"eMudhra", b"emSign"];
 fn is_distrusted(der: &[u8]) -> bool {
     DISTRUSTED_ISSUERS
         .iter()
-        .any(|needle| der.windows(needle.len()).any(|w| w == *needle))
+        .any(|needle| {
+            der.windows(needle.len())
+                .any(|w| w == *needle)
+        })
 }
 
 /// The trusted roots, as DER.
@@ -54,12 +57,17 @@ pub fn http_client() -> anyhow::Result<reqwest::Client> {
     let certs = roots()
         .map(|c| reqwest::Certificate::from_der(c.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(reqwest::Client::builder().tls_certs_only(certs).build()?)
+    Ok(reqwest::Client::builder()
+        .tls_certs_only(certs)
+        .build()?)
 }
 
-pub fn smtp_tls_parameters(domain: &str) -> anyhow::Result<lettre::transport::smtp::client::TlsParameters> {
+pub fn smtp_tls_parameters(
+    domain: &str,
+) -> anyhow::Result<lettre::transport::smtp::client::TlsParameters> {
     use lettre::transport::smtp::client::{Certificate, CertificateStore, TlsParameters};
-    let mut builder = TlsParameters::builder(domain.to_owned()).certificate_store(CertificateStore::None);
+    let mut builder =
+        TlsParameters::builder(domain.to_owned()).certificate_store(CertificateStore::None);
     for c in roots() {
         builder = builder.add_root_certificate(Certificate::from_der(c.to_vec())?);
     }
@@ -81,16 +89,28 @@ mod tests {
     fn emsign_g3() -> (CertificateDer<'static>, TrustAnchor<'static>) {
         let cert = CertificateDer::from_pem_slice(EMSIGN_ECC_ROOT_CA_G3).unwrap();
         let mut store = RootCertStore::empty();
-        store.add(cert.clone()).unwrap();
-        (cert, store.roots.pop().unwrap())
+        store
+            .add(cert.clone())
+            .unwrap();
+        (
+            cert,
+            store
+                .roots
+                .pop()
+                .unwrap(),
+        )
     }
 
     /// True if `store` would accept chains ending at `anchor`: same subject name,
     /// or the same key (catches a re-issued root carrying the compromised key).
     fn trusts(store: &RootCertStore, anchor: &TrustAnchor) -> bool {
-        store.roots.iter().any(|a| {
-            a.subject == anchor.subject || a.subject_public_key_info == anchor.subject_public_key_info
-        })
+        store
+            .roots
+            .iter()
+            .any(|a| {
+                a.subject == anchor.subject
+                    || a.subject_public_key_info == anchor.subject_public_key_info
+            })
     }
 
     #[test]
@@ -108,7 +128,9 @@ mod tests {
 
         // Control: the check does detect the root when it is present.
         let mut with_g3 = root_store();
-        with_g3.add(cert).unwrap();
+        with_g3
+            .add(cert)
+            .unwrap();
         assert!(trusts(&with_g3, &anchor));
     }
 
@@ -122,9 +144,16 @@ mod tests {
     #[test]
     fn common_roots_still_trusted() {
         // Apple and Google mail chain to these; losing them would break everything.
-        for name in [&b"ISRG Root X1"[..], b"GTS Root R1", b"DigiCert Global Root G2"] {
+        for name in [
+            &b"ISRG Root X1"[..],
+            b"GTS Root R1",
+            b"DigiCert Global Root G2",
+        ] {
             assert!(
-                roots().any(|c| c.as_ref().windows(name.len()).any(|w| w == name)),
+                roots().any(|c| c
+                    .as_ref()
+                    .windows(name.len())
+                    .any(|w| w == name)),
                 "missing {}",
                 String::from_utf8_lossy(name)
             );
@@ -139,15 +168,25 @@ mod tests {
         use lettre::{AsyncSmtpTransport, Tokio1Executor, transport::smtp::client::Tls};
         init();
         for host in ["imap.mail.me.com", "imap.gmail.com"] {
-            let tcp = tokio::net::TcpStream::connect((host, 993)).await.unwrap();
+            let tcp = tokio::net::TcpStream::connect((host, 993))
+                .await
+                .unwrap();
             tokio_rustls::TlsConnector::from(client_config())
                 .connect(rustls::pki_types::ServerName::try_from(host).unwrap(), tcp)
                 .await
                 .unwrap_or_else(|e| panic!("{host}: {e}"));
         }
         for (host, port, tls) in [
-            ("smtp.mail.me.com", 587, Tls::Required(smtp_tls_parameters("smtp.mail.me.com").unwrap())),
-            ("smtp.gmail.com", 465, Tls::Wrapper(smtp_tls_parameters("smtp.gmail.com").unwrap())),
+            (
+                "smtp.mail.me.com",
+                587,
+                Tls::Required(smtp_tls_parameters("smtp.mail.me.com").unwrap()),
+            ),
+            (
+                "smtp.gmail.com",
+                465,
+                Tls::Wrapper(smtp_tls_parameters("smtp.gmail.com").unwrap()),
+            ),
         ] {
             let ok = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
                 .port(port)

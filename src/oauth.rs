@@ -59,7 +59,12 @@ pub async fn begin_login(client: &GoogleOauthClient, login_hint: &str) -> Result
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("binding loopback listener for OAuth redirect")?;
-    let redirect_uri = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}",
+        listener
+            .local_addr()?
+            .port()
+    );
     let verifier = random_token();
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_token();
@@ -67,7 +72,12 @@ pub async fn begin_login(client: &GoogleOauthClient, login_hint: &str) -> Result
     let auth_url = url::Url::parse_with_params(
         AUTH_URL,
         &[
-            ("client_id", client.client_id.as_str()),
+            (
+                "client_id",
+                client
+                    .client_id
+                    .as_str(),
+            ),
             ("redirect_uri", redirect_uri.as_str()),
             ("response_type", "code"),
             ("scope", SCOPE),
@@ -114,14 +124,22 @@ impl PendingLogin {
 
     async fn wait_for_code(&self) -> Result<String> {
         loop {
-            let (mut sock, _) = self.listener.accept().await?;
+            let (mut sock, _) = self
+                .listener
+                .accept()
+                .await?;
             let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await?;
+            let n = sock
+                .read(&mut buf)
+                .await?;
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req
                 .lines()
                 .next()
-                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .nth(1)
+                })
                 .unwrap_or("/");
             let url = url::Url::parse(&format!("http://localhost{path}"))?;
             let param = |k: &str| {
@@ -131,19 +149,34 @@ impl PendingLogin {
             };
 
             // Browsers also request /favicon.ico and the like; ignore anything without our state.
-            if param("state").as_deref() != Some(self.state.as_str()) {
+            if param("state").as_deref()
+                != Some(
+                    self.state
+                        .as_str(),
+                )
+            {
                 respond(&mut sock, 404, "Not found").await;
                 continue;
             }
             if let Some(err) = param("error") {
-                respond(&mut sock, 400, &format!("Sign-in failed: {err}. You can close this tab.")).await;
+                respond(
+                    &mut sock,
+                    400,
+                    &format!("Sign-in failed: {err}. You can close this tab."),
+                )
+                .await;
                 bail!("authorization denied: {err}");
             }
             let Some(code) = param("code") else {
                 respond(&mut sock, 400, "Missing authorization code.").await;
                 bail!("redirect did not include an authorization code");
             };
-            respond(&mut sock, 200, "Signed in to email-mcp. You can close this tab.").await;
+            respond(
+                &mut sock,
+                200,
+                "Signed in to email-mcp. You can close this tab.",
+            )
+            .await;
             return Ok(code);
         }
     }
@@ -155,8 +188,12 @@ async fn respond(sock: &mut tokio::net::TcpStream, status: u16, msg: &str) {
         "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = sock.write_all(resp.as_bytes()).await;
-    let _ = sock.shutdown().await;
+    let _ = sock
+        .write_all(resp.as_bytes())
+        .await;
+    let _ = sock
+        .shutdown()
+        .await;
 }
 
 pub async fn refresh(client: &GoogleOauthClient, refresh_token: &str) -> Result<AccessToken> {
@@ -185,13 +222,17 @@ async fn token_request(form: &[(&str, &str)]) -> Result<TokenResponse> {
         .await
         .context("contacting Google token endpoint")?;
     let status = resp.status();
-    let body = resp.text().await?;
+    let body = resp
+        .text()
+        .await?;
     if !status.is_success() {
         if let Ok(e) = serde_json::from_str::<TokenError>(&body) {
             bail!(
                 "Google token endpoint: {}{}",
                 e.error,
-                e.error_description.map(|d| format!(" ({d})")).unwrap_or_default()
+                e.error_description
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default()
             );
         }
         bail!("Google token endpoint returned {status}: {body}");

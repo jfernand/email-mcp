@@ -23,14 +23,24 @@ fn transport(account: &Account, cred: &Credential) -> Result<AsyncSmtpTransport<
         AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&account.smtp_host)
             .port(account.smtp_port)
             .tls(tls)
-            .credentials(Credentials::new(account.username().to_owned(), secret))
+            .credentials(Credentials::new(
+                account
+                    .username()
+                    .to_owned(),
+                secret,
+            ))
             .authentication(mechanisms)
             .timeout(Some(Duration::from_secs(60)))
             .build(),
     )
 }
 
-pub async fn send(account: &Account, cred: &Credential, envelope: &Envelope, raw: &[u8]) -> Result<()> {
+pub async fn send(
+    account: &Account,
+    cred: &Credential,
+    envelope: &Envelope,
+    raw: &[u8],
+) -> Result<()> {
     transport(account, cred)?
         .send_raw(envelope, raw)
         .await
