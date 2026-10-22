@@ -62,6 +62,18 @@ email-mcp --describe          # instructions, tools and parameters as text
 email-mcp --describe --json   # the raw tool schemas
 ```
 
+## Structure
+
+The repository is a Cargo workspace with two crates:
+
+| Crate | Role |
+|---|---|
+| [`email-engine`](email-engine) | The mail engine: accounts, credentials, IMAP, SMTP and composing, as typed async operations. No MCP dependency. |
+| `email-mcp` (root) | The MCP server: tool parameter schemas, JSON results, and the guidance the agent receives. |
+
+IMAP calls run under deadlines (connect 30 s, NOOP/SELECT 30 s, a whole tool call 180 s), so a
+stalled server fails the call instead of hanging every later call for that account.
+
 ## TLS
 
 All connections (IMAP, SMTP, OAuth) use Mozilla's root store from `webpki-root-certs` rather

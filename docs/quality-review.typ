@@ -120,6 +120,17 @@ The cheapest gains are pure functions that already exist and carry real risk. In
 
 = Suggested order <sec-order>
 
+#callout(kind: "ok", "Progress — 2026-10-22")[
+  Done: the #cd[EXPUNGE] fallback now removes only the requested UIDs (other #cd[\\Deleted]
+  messages are unflagged around it and re-flagged)\; IMAP sessions, the OAuth HTTP client and the
+  loopback callback have deadlines\; UID sets collapse into ranges\; the code is split into an
+  #cd[email-engine] library (typed operations, no MCP dependency) and the #cd[email-mcp] front end,
+  with tool schemas verified unchanged\; tests cover search-query building, flag and date
+  validation, file-name safety, account defaults and updates, and message parsing. Line coverage
+  rose from 24.8 % to 36.8 %. Still open: CI with an MSRV job, the #cd[MailServer] fake, and
+  tests for the network-facing layers.
+]
+
 + Fix the #cd[EXPUNGE] fallback and add command timeouts (§ 2).
 + Add CI with an MSRV job.
 + Library split, then the #cd[server/] module split.

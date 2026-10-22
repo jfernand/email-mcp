@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Well-known providers; each fills in server defaults for its accounts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     /// iCloud Mail (me.com, mac.com, icloud.com). Requires an app-specific password.
@@ -16,7 +16,8 @@ pub enum Provider {
     Custom,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     /// Username + password (for iCloud and Gmail this must be an app-specific password).
@@ -25,7 +26,8 @@ pub enum AuthMethod {
     Oauth2,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SmtpSecurity {
     /// Implicit TLS (usually port 465).
@@ -35,7 +37,8 @@ pub enum SmtpSecurity {
 }
 
 /// What delete_messages does by default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RemoveBy {
     /// Move messages to the Trash mailbox; they can be recovered from there.
@@ -89,7 +92,8 @@ pub struct GoogleOauthClient {
     pub client_secret: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SecretStore {
     /// OS keyring (Secret Service on Linux, Keychain on macOS).

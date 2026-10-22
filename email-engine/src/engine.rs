@@ -5,33 +5,43 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 
-use crate::config::{Account, AuthMethod, Config};
+use crate::config::{Account, AuthMethod, Config, GoogleOauthClient, SecretStore};
 use crate::imap::{self, Credential, Pool, Session};
 use crate::oauth::{self, AccessToken};
 use crate::secrets::{self, SecretKind};
 
+/// State of a Google sign-in started by [`Engine::login`] and still finishing in the background.
 #[derive(Debug, Clone)]
 pub enum LoginState {
     Waiting { auth_url: String },
     Failed(String),
 }
 
+/// The mail engine: configured accounts, their credentials, and one cached IMAP session per
+/// account. Every operation takes an account key (id or email; `None` = the default account).
 #[derive(Default)]
-pub struct App {
-    pub config: RwLock<Config>,
-    pub pool: Pool,
+pub struct Engine {
+    pub(crate) config: RwLock<Config>,
+    pool: Pool,
     tokens: Mutex<HashMap<String, AccessToken>>,
-    pub logins: Mutex<HashMap<String, LoginState>>,
+    pub(crate) logins: Mutex<HashMap<String, LoginState>>,
 }
 
-impl App {
+impl Engine {
+    /// Load the account configuration from disk (see [`crate::config::config_dir`]).
     pub fn load() -> Result<Arc<Self>> {
-        Ok(Arc::new(Self {
-            config: RwLock::new(Config::load()?),
-            ..Default::default()
-        }))
+        Ok(Arc::new(Self::with_config(Config::load()?)))
     }
 
+    /// An engine over an in-memory configuration, for tests and embedding.
+    pub fn with_config(config: Config) -> Self {
+        Self {
+            config: RwLock::new(config),
+            ..Default::default()
+        }
+    }
+
+    /// The account `key` names (id or email), or the default account for `None`.
     pub async fn account(&self, key: Option<&str>) -> Result<Account> {
         Ok(self
             .config
@@ -41,13 +51,18 @@ impl App {
             .clone())
     }
 
-    /// Credential for IMAP/SMTP, refreshing the OAuth access token if needed.
-    pub async fn credential(&self, account: &Account) -> Result<Credential> {
-        let store = self
-            .config
+    pub(crate) async fn secret_store(&self) -> SecretStore {
+        self.config
             .read()
             .await
-            .secret_store;
+            .secret_store
+    }
+
+    /// Credential for IMAP/SMTP, refreshing the OAuth access token if needed.
+    pub(crate) async fn credential(&self, account: &Account) -> Result<Credential> {
+        let store = self
+            .secret_store()
+            .await;
         match account.auth {
             AuthMethod::Password => secrets::get(store, &account.id, SecretKind::Password)
                 .await?
@@ -86,21 +101,14 @@ impl App {
                 let value = token
                     .token
                     .clone();
-                self.tokens
-                    .lock()
-                    .await
-                    .insert(
-                        account
-                            .id
-                            .clone(),
-                        token,
-                    );
+                self.cache_token(&account.id, token)
+                    .await;
                 Ok(Credential::OauthToken(value))
             }
         }
     }
 
-    pub async fn oauth_client(&self) -> Result<crate::config::GoogleOauthClient> {
+    pub(crate) async fn oauth_client(&self) -> Result<GoogleOauthClient> {
         self.config
             .read()
             .await
@@ -111,14 +119,15 @@ impl App {
             })
     }
 
-    pub async fn cache_token(&self, account_id: &str, token: AccessToken) {
+    pub(crate) async fn cache_token(&self, account_id: &str, token: AccessToken) {
         self.tokens
             .lock()
             .await
             .insert(account_id.to_owned(), token);
     }
 
-    pub async fn forget(&self, account_id: &str) {
+    /// Drop the account's session, cached token and any pending sign-in.
+    pub(crate) async fn forget(&self, account_id: &str) {
         self.pool
             .drop_session(account_id)
             .await;

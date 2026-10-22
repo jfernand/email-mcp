@@ -616,7 +616,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "email-mcp"
+name = "email-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -631,18 +631,30 @@ dependencies = [
  "mail-parser",
  "rand",
  "reqwest",
- "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "toml",
- "tracing",
- "tracing-subscriber",
  "url",
  "webpki-root-certs",
+]
+
+[[package]]
+name = "email-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "email-engine",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,16 +1,9 @@
-mod app;
-mod compose;
-mod config;
 mod describe;
-mod imap;
-mod oauth;
-mod secrets;
 mod server;
-mod smtp;
-mod tls;
 
 use std::sync::Arc;
 
+use email_engine::{Engine, tls};
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
@@ -31,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         [] => {}
         ["--describe"] | ["--describe", "--json"] | ["--json", "--describe"] => {
             // No config or network needed: the tool list is static.
-            let server = server::EmailServer::new(Arc::new(app::App::default()));
+            let server = server::EmailServer::new(Arc::new(Engine::default()));
             if args.contains(&"--json") {
                 println!(
                     "{}",
@@ -60,8 +53,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
     tls::init();
 
-    let app = app::App::load()?;
-    let service = server::EmailServer::new(app)
+    let engine = Engine::load()?;
+    let service = server::EmailServer::new(engine)
         .serve(rmcp::transport::stdio_pipes())
         .await?;
     service

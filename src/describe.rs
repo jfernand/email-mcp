@@ -239,7 +239,7 @@ mod tests {
     use std::sync::Arc;
 
     fn server() -> EmailServer {
-        EmailServer::new(Arc::new(crate::app::App::default()))
+        EmailServer::new(Arc::new(email_engine::Engine::default()))
     }
 
     #[test]

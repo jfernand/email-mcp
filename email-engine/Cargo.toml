@@ -1,0 +1,44 @@
+[package]
+name = "email-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Multi-account email engine: accounts, credentials, IMAP, SMTP and composing, for iCloud, Gmail and other servers"
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords = ["email", "imap", "smtp", "gmail", "icloud"]
+categories = ["email"]
+include = ["/src", "/tests", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
+
+[features]
+# JSON Schema derives on the account setting enums, for front ends (such as
+# email-mcp) that expose them as typed tool parameters.
+schema = ["dep:schemars"]
+
+[dependencies]
+anyhow = "1.0.104"
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+base64 = "0.23.1"
+chrono = "0.4.45"
+directories = "6.0.0"
+futures = "0.3.34"
+html2text = "0.17.4"
+keyring = "4.2.0"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "hostname"] }
+mail-parser = "0.11.9"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "form"] }
+schemars = { version = "1.2.3", optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["rt", "net", "time", "sync", "io-util"] }
+tokio-rustls = "0.26.6"
+toml = "1.1.8"
+url = "2.5.8"
+webpki-root-certs = "1.0.10"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }

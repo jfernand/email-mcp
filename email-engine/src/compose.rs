@@ -14,6 +14,14 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    /// Read each local file as an attachment.
+    pub fn from_paths(paths: &[String]) -> Result<Vec<Self>> {
+        paths
+            .iter()
+            .map(|p| Self::from_path(p))
+            .collect()
+    }
+
     pub fn from_path(path: &str) -> Result<Self> {
         let p = std::path::Path::new(path);
         let data = std::fs::read(p).with_context(|| format!("reading attachment {path}"))?;

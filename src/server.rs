@@ -1,7 +1,14 @@
+//! The MCP front end: tool parameter schemas, JSON results, and the guidance the agent gets.
+//! All mail work is done by [`email_engine::Engine`].
+
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
-use mail_parser::{MessageParser, MimeHeaders};
+use email_engine::accounts::{AccountStatus, AccountUpdate, LoginStart, NewAccount};
+use email_engine::compose::{Attachment, Compose};
+use email_engine::config::{Account, AuthMethod, Provider, RemoveBy, SmtpSecurity};
+use email_engine::messages::{MessagePage, MessageSummary, MessageView, SearchCriteria};
+use email_engine::sending::SendReport;
+use email_engine::{Engine, LoginState, oauth};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -10,21 +17,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::app::{App, LoginState};
-use crate::compose::{self, Attachment, Compose};
-use crate::config::{
-    Account, AuthMethod, GoogleOauthClient, Provider, RemoveBy, SmtpSecurity, guess_provider,
-    provider_defaults, validate_id,
-};
-use crate::imap::{self, SpecialUse};
-use crate::oauth;
-use crate::secrets::{self, SecretKind};
-use crate::smtp;
-
 type ToolResult = Result<String, String>;
 
 fn done(v: Value) -> ToolResult {
-    Ok(serde_json::to_string_pretty(&v).unwrap())
+    Ok(serde_json::to_string_pretty(&v).expect("a JSON value always serializes"))
 }
 
 fn fail(e: anyhow::Error) -> String {
@@ -33,14 +29,14 @@ fn fail(e: anyhow::Error) -> String {
 
 #[derive(Clone)]
 pub struct EmailServer {
-    app: Arc<App>,
+    engine: Arc<Engine>,
     tool_router: ToolRouter<Self>,
 }
 
 impl EmailServer {
-    pub fn new(app: Arc<App>) -> Self {
+    pub fn new(engine: Arc<Engine>) -> Self {
         Self {
-            app,
+            engine,
             tool_router: Self::tool_router(),
         }
     }
@@ -48,6 +44,13 @@ impl EmailServer {
     pub fn tools(&self) -> Vec<rmcp::model::Tool> {
         self.tool_router
             .list_all()
+    }
+
+    async fn account(&self, key: Option<&str>) -> Result<Account, String> {
+        self.engine
+            .account(key)
+            .await
+            .map_err(fail)
     }
 }
 
@@ -402,7 +405,7 @@ pub struct LabelArgs {
     pub remove: Vec<String>,
 }
 
-// ---------- helpers ----------
+// ---------- JSON results ----------
 
 fn account_json(a: &Account, index: usize) -> Value {
     json!({
@@ -440,66 +443,72 @@ fn remove_guidance(a: &Account) -> String {
     }
 }
 
-fn summary_json(s: &imap::Summary) -> Value {
-    let parsed = MessageParser::default().parse(&s.headers);
-    let get = |f: fn(&mail_parser::Message) -> Vec<String>| {
-        parsed
-            .as_ref()
-            .map(f)
-            .unwrap_or_default()
-    };
+fn summary_json(s: &MessageSummary) -> Value {
     json!({
         "uid": s.uid,
-        "from": get(|m| compose::addresses(m.from())),
-        "to": get(|m| compose::addresses(m.to())),
-        "subject": parsed.as_ref().and_then(|m| m.subject()).unwrap_or(""),
-        "date": parsed.as_ref().and_then(|m| m.date()).map(|d| d.to_rfc3339()).or(s.internal_date.clone()),
-        "unread": !s.flags.iter().any(|f| f == "\\Seen"),
-        "flagged": s.flags.iter().any(|f| f == "\\Flagged"),
+        "from": s.from,
+        "to": s.to,
+        "subject": s.subject,
+        "date": s.date,
+        "unread": s.unread,
+        "flagged": s.flagged,
         "flags": s.flags,
         "size": s.size,
     })
 }
 
-fn imap_flag(name: &str) -> Result<String> {
-    let f = match name
-        .trim()
-        .trim_start_matches('\\')
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "seen" | "read" => "\\Seen".into(),
-        "flagged" | "starred" => "\\Flagged".into(),
-        "answered" | "replied" => "\\Answered".into(),
-        "draft" => "\\Draft".into(),
-        "deleted" => "\\Deleted".into(),
-        _ => {
-            let k = name.trim();
-            if k.is_empty()
-                || !k
-                    .chars()
-                    .all(|c| c.is_ascii_graphic() && !"(){%*\"\\]".contains(c))
-            {
-                bail!("invalid flag/keyword '{name}'");
-            }
-            k.to_owned()
-        }
-    };
-    Ok(f)
-}
-
-fn imap_date(s: &str) -> Result<String> {
-    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|_| anyhow!("invalid date '{s}', expected YYYY-MM-DD"))?;
-    Ok(d.format("%d-%b-%Y")
-        .to_string())
-}
-
-fn load_attachments(paths: &[String]) -> Result<Vec<Attachment>> {
-    paths
+fn page_json(page: &MessagePage) -> Vec<Value> {
+    page.messages
         .iter()
-        .map(|p| Attachment::from_path(p))
+        .map(summary_json)
         .collect()
+}
+
+fn status_json(st: &AccountStatus) -> Value {
+    let mut v = json!({
+        "account": st.account.id,
+        "email": st.account.email,
+        "auth": st.account.auth,
+        "logged_in": match &st.logged_in {
+            Ok(b) => json!(b),
+            Err(e) => json!(format!("error reading secret store: {e}")),
+        },
+    });
+    if let Some(state) = &st.pending_login {
+        v["pending_login"] = match state {
+            LoginState::Waiting { auth_url } => {
+                json!({ "status": "waiting", "auth_url": auth_url })
+            }
+            LoginState::Failed(e) => json!({ "status": "failed", "error": e }),
+        };
+    }
+    if let Some(c) = &st.connection {
+        let show = |r: &Result<(), String>| match r {
+            Ok(()) => json!("ok"),
+            Err(e) => json!(format!("error: {e}")),
+        };
+        v["connection"] = json!({ "imap": show(&c.imap), "smtp": show(&c.smtp) });
+    }
+    v
+}
+
+fn sent_json(account: &Account, c: &Compose, report: &SendReport) -> Value {
+    json!({
+        "sent": true,
+        "account": account.id,
+        "to": c.to, "cc": c.cc, "bcc": c.bcc,
+        "subject": c.subject,
+        "notes": report.notes,
+    })
+}
+
+fn draft_json(mailbox: &str, replace_uid: Option<u32>, c: &Compose) -> Value {
+    json!({
+        "saved": true,
+        "mailbox": mailbox,
+        "replaced_uid": replace_uid,
+        "subject": c.subject,
+    })
 }
 
 fn truncate(s: String, max: usize) -> (String, bool) {
@@ -518,41 +527,6 @@ fn truncate(s: String, max: usize) -> (String, bool) {
     }
 }
 
-fn safe_filename(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if matches!(c, '/' | '\\' | '\0' | ':') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let cleaned = cleaned
-        .trim_start_matches('.')
-        .trim();
-    if cleaned.is_empty() {
-        "attachment".into()
-    } else {
-        cleaned.to_owned()
-    }
-}
-
-fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    let mut path = dir.join(name);
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) => (s.to_owned(), format!(".{e}")),
-        None => (name.to_owned(), String::new()),
-    };
-    let mut n = 1;
-    while path.exists() {
-        path = dir.join(format!("{stem} ({n}){ext}"));
-        n += 1;
-    }
-    path
-}
-
 fn open_browser(url: &str) {
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -568,160 +542,29 @@ fn open_browser(url: &str) {
 }
 
 impl EmailServer {
-    async fn resolve_mailbox(&self, account: &Account, name: &str) -> Result<String> {
-        let kind = match name
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "archive" => SpecialUse::Archive,
-            "trash" => SpecialUse::Trash,
-            "junk" | "spam" => SpecialUse::Junk,
-            "sent" => SpecialUse::Sent,
-            "drafts" => SpecialUse::Drafts,
-            _ => return Ok(name.to_owned()),
-        };
-        if kind == SpecialUse::Trash
-            && let Some(t) = &account.trash_mailbox
-        {
-            return Ok(t.clone());
-        }
-        self.app
-            .with_session(account, None, async |s| {
-                // Prefer an exact mailbox name match before special-use resolution.
-                let boxes = imap::list_mailboxes(s).await?;
-                if let Some(b) = boxes
-                    .iter()
-                    .find(|b| b.name == name)
-                {
-                    return Ok(b
-                        .name
-                        .clone());
-                }
-                imap::find_special(s, kind).await
-            })
-            .await
-    }
-
-    async fn fetch_parsed(&self, account: &Account, mailbox: &str, uid: u32) -> Result<Vec<u8>> {
-        self.app
-            .with_session(account, Some(mailbox), async |s| {
-                Ok(imap::fetch_raw(s, uid)
-                    .await?
-                    .0)
-            })
-            .await
-    }
-
-    /// Send a composed message, file a copy in Sent if the provider doesn't, and
-    /// optionally mark the message being replied to as answered.
-    async fn send_compose(
+    /// Send `c`, or save it as a draft, and describe the outcome.
+    async fn send_or_draft(
         &self,
         account: &Account,
         c: &Compose,
+        draft_only: bool,
         answered: Option<(&str, u32)>,
-    ) -> Result<Value> {
-        if c.to
-            .is_empty()
-            && c.cc
-                .is_empty()
-            && c.bcc
-                .is_empty()
-        {
-            bail!("no recipients");
+    ) -> ToolResult {
+        if draft_only {
+            let mailbox = self
+                .engine
+                .save_draft(account, c, None)
+                .await
+                .map_err(fail)?;
+            done(draft_json(&mailbox, None, c))
+        } else {
+            let report = self
+                .engine
+                .send(account, c, answered)
+                .await
+                .map_err(fail)?;
+            done(sent_json(account, c, &report))
         }
-        let msg = compose::build(account, c, false)?;
-        let raw = msg.formatted();
-        let cred = self
-            .app
-            .credential(account)
-            .await?;
-        smtp::send(account, &cred, msg.envelope(), &raw).await?;
-
-        let mut notes = vec![];
-        if account.save_sent {
-            let r = self
-                .app
-                .with_session(account, None, async |s| {
-                    let sent = imap::find_special(s, SpecialUse::Sent).await?;
-                    s.append(&sent, Some("(\\Seen)"), None, &raw)
-                        .await?;
-                    Ok(sent)
-                })
-                .await;
-            match r {
-                Ok(sent) => notes.push(format!("copy saved to {sent}")),
-                Err(e) => notes.push(format!("sent, but saving a copy to Sent failed: {e:#}")),
-            }
-        }
-        if let Some((mailbox, uid)) = answered {
-            let _ = self
-                .app
-                .with_session(account, Some(mailbox), async |s| {
-                    imap::store_flags(s, &[uid], "+", &["\\Answered".into()]).await
-                })
-                .await;
-        }
-        Ok(json!({
-            "sent": true,
-            "account": account.id,
-            "to": c.to, "cc": c.cc, "bcc": c.bcc,
-            "subject": c.subject,
-            "notes": notes,
-        }))
-    }
-
-    async fn save_draft_compose(
-        &self,
-        account: &Account,
-        c: &Compose,
-        replace_uid: Option<u32>,
-    ) -> Result<Value> {
-        let raw = compose::build(account, c, true)?.formatted();
-        self.app
-            .with_session(account, None, async |s| {
-                let drafts = imap::find_special(s, SpecialUse::Drafts).await?;
-                s.append(&drafts, Some("(\\Draft \\Seen)"), None, &raw)
-                    .await?;
-                if let Some(old) = replace_uid {
-                    s.select(&drafts)
-                        .await?;
-                    imap::store_flags(s, &[old], "+", &["\\Deleted".into()]).await?;
-                    imap::expunge_uids(s, &[old]).await?;
-                }
-                Ok(json!({
-                    "saved": true,
-                    "mailbox": drafts,
-                    "replaced_uid": replace_uid,
-                    "subject": c.subject,
-                }))
-            })
-            .await
-    }
-
-    async fn verify(&self, account: &Account) -> Value {
-        let imap = match self
-            .app
-            .with_session(account, None, async |s| {
-                Ok(s.noop()
-                    .await?)
-            })
-            .await
-        {
-            Ok(()) => json!("ok"),
-            Err(e) => json!(format!("error: {e:#}")),
-        };
-        let smtp = match self
-            .app
-            .credential(account)
-            .await
-        {
-            Ok(cred) => match smtp::test(account, &cred).await {
-                Ok(()) => json!("ok"),
-                Err(e) => json!(format!("error: {e:#}")),
-            },
-            Err(e) => json!(format!("error: {e:#}")),
-        };
-        json!({ "imap": imap, "smtp": smtp })
     }
 }
 
@@ -735,12 +578,11 @@ impl EmailServer {
         description = "List configured email accounts. The first account is the default used when a tool's `account` is omitted."
     )]
     async fn list_accounts(&self) -> ToolResult {
-        let cfg = self
-            .app
-            .config
-            .read()
+        let list = self
+            .engine
+            .accounts()
             .await;
-        let accounts: Vec<_> = cfg
+        let accounts: Vec<_> = list
             .accounts
             .iter()
             .enumerate()
@@ -748,8 +590,8 @@ impl EmailServer {
             .collect();
         done(json!({
             "accounts": accounts,
-            "google_oauth_client_configured": cfg.google_oauth.is_some(),
-            "secret_store": cfg.secret_store,
+            "google_oauth_client_configured": list.google_oauth_configured,
+            "secret_store": list.secret_store,
         }))
     }
 
@@ -760,132 +602,33 @@ impl EmailServer {
         Pass `password` to log in immediately, or call `login` afterwards."
     )]
     async fn add_account(&self, Parameters(a): Parameters<AddAccountArgs>) -> ToolResult {
-        let email = a
-            .email
-            .trim()
-            .to_owned();
-        if !email.contains('@') {
-            return Err(format!("'{email}' is not an email address"));
-        }
-        let provider = a
-            .provider
-            .unwrap_or_else(|| guess_provider(&email));
-        let defaults = provider_defaults(provider);
-        let id =
-            a.id.unwrap_or_else(|| {
-                email
-                    .split('@')
-                    .next()
-                    .unwrap()
-                    .to_ascii_lowercase()
-                    .replace('.', "-")
-            });
-        validate_id(&id).map_err(fail)?;
-        let auth = a
-            .auth
-            .or(defaults
-                .as_ref()
-                .map(|d| d.auth))
-            .unwrap_or(AuthMethod::Password);
-        if auth == AuthMethod::Oauth2 && provider != Provider::Gmail {
-            return Err("OAuth2 is only supported for Gmail accounts".into());
-        }
-        let need = |v: Option<String>, d: Option<&'static str>, what: &str| {
-            v.or(d.map(str::to_owned))
-                .ok_or_else(|| format!("{what} is required for custom providers"))
-        };
-        let account = Account {
-            id: id.clone(),
-            email: email.clone(),
-            display_name: a.display_name,
-            provider,
-            auth,
-            username: a.username,
-            imap_host: need(
-                a.imap_host,
-                defaults
-                    .as_ref()
-                    .map(|d| d.imap_host),
-                "imap_host",
-            )?,
-            imap_port: a
-                .imap_port
-                .or(defaults
-                    .as_ref()
-                    .map(|d| d.imap_port))
-                .unwrap_or(993),
-            smtp_host: need(
-                a.smtp_host,
-                defaults
-                    .as_ref()
-                    .map(|d| d.smtp_host),
-                "smtp_host",
-            )?,
-            smtp_port: a
-                .smtp_port
-                .or(defaults
-                    .as_ref()
-                    .map(|d| d.smtp_port))
-                .unwrap_or(587),
-            smtp_security: a
-                .smtp_security
-                .or(defaults
-                    .as_ref()
-                    .map(|d| d.smtp_security))
-                .unwrap_or(SmtpSecurity::Starttls),
-            save_sent: a
-                .save_sent
-                .or(defaults
-                    .as_ref()
-                    .map(|d| d.save_sent))
-                .unwrap_or(true),
-            remove_by: a
-                .remove_by
-                .unwrap_or_default(),
-            trash_mailbox: None,
-        };
-
-        let pos = {
-            let mut cfg = self
-                .app
-                .config
-                .write()
-                .await;
-            if cfg
-                .accounts
-                .iter()
-                .any(|x| {
-                    x.id == id
-                        || x.email
-                            .eq_ignore_ascii_case(&email)
-                })
-            {
-                return Err(format!(
-                    "an account with id '{id}' or email '{email}' already exists"
-                ));
-            }
-            let pos = a
-                .position
-                .unwrap_or(
-                    cfg.accounts
-                        .len(),
-                )
-                .min(
-                    cfg.accounts
-                        .len(),
-                );
-            cfg.accounts
-                .insert(pos, account.clone());
-            cfg.save()
-                .map_err(fail)?;
-            pos
-        };
-
-        let mut result = json!({ "added": account_json(&account, pos) });
+        let added = self
+            .engine
+            .add_account(NewAccount {
+                email: a.email,
+                id: a.id,
+                display_name: a.display_name,
+                provider: a.provider,
+                auth: a.auth,
+                username: a.username,
+                imap_host: a.imap_host,
+                imap_port: a.imap_port,
+                smtp_host: a.smtp_host,
+                smtp_port: a.smtp_port,
+                smtp_security: a.smtp_security,
+                save_sent: a.save_sent,
+                remove_by: a.remove_by,
+                position: a.position,
+            })
+            .await
+            .map_err(fail)?;
+        let mut result = json!({ "added": account_json(&added.account, added.index) });
         if let Some(pw) = a.password {
             result["login"] = match self
                 .login(Parameters(LoginArgs {
-                    account: id,
+                    account: added
+                        .account
+                        .id,
                     password: Some(pw),
                 }))
                 .await
@@ -903,112 +646,29 @@ impl EmailServer {
         description = "Change an account's settings or its position in the list (position 0 = default account)."
     )]
     async fn update_account(&self, Parameters(u): Parameters<UpdateAccountArgs>) -> ToolResult {
-        if let Some(t) = u
-            .trash_mailbox
-            .as_deref()
-            .filter(|t| !t.is_empty())
-        {
-            let current = self
-                .app
-                .account(Some(&u.account))
-                .await
-                .map_err(fail)?;
-            let boxes = self
-                .app
-                .with_session(&current, None, async |s| imap::list_mailboxes(s).await)
-                .await
-                .map_err(fail)?;
-            if !boxes
-                .iter()
-                .any(|b| b.name == t && b.selectable)
-            {
-                return Err(format!(
-                    "no mailbox named '{t}' on account '{}'",
-                    current.id
-                ));
-            }
-        }
-        let (account, changed_auth) = {
-            let mut cfg = self
-                .app
-                .config
-                .write()
-                .await;
-            let idx = cfg
-                .index_of(&u.account)
-                .map_err(fail)?;
-            let mut a = cfg
-                .accounts
-                .remove(idx);
-            let old_auth = a.auth;
-            if let Some(v) = u.display_name {
-                a.display_name = Some(v).filter(|s| !s.is_empty());
-            }
-            if let Some(v) = u.username {
-                a.username = Some(v).filter(|s| !s.is_empty());
-            }
-            if let Some(v) = u.auth {
-                if v == AuthMethod::Oauth2 && a.provider != Provider::Gmail {
-                    cfg.accounts
-                        .insert(idx, a);
-                    return Err("OAuth2 is only supported for Gmail accounts".into());
-                }
-                a.auth = v;
-            }
-            if let Some(v) = u.imap_host {
-                a.imap_host = v;
-            }
-            if let Some(v) = u.imap_port {
-                a.imap_port = v;
-            }
-            if let Some(v) = u.smtp_host {
-                a.smtp_host = v;
-            }
-            if let Some(v) = u.smtp_port {
-                a.smtp_port = v;
-            }
-            if let Some(v) = u.smtp_security {
-                a.smtp_security = v;
-            }
-            if let Some(v) = u.save_sent {
-                a.save_sent = v;
-            }
-            if let Some(v) = u.remove_by {
-                a.remove_by = v;
-            }
-            if let Some(v) = u.trash_mailbox {
-                a.trash_mailbox = Some(v).filter(|s| !s.is_empty());
-            }
-            let pos = u
-                .position
-                .unwrap_or(idx)
-                .min(
-                    cfg.accounts
-                        .len(),
-                );
-            cfg.accounts
-                .insert(pos, a.clone());
-            cfg.save()
-                .map_err(fail)?;
-            (
-                a,
-                old_auth
-                    != u.auth
-                        .unwrap_or(old_auth),
+        let (updated, auth_changed) = self
+            .engine
+            .update_account(
+                &u.account,
+                AccountUpdate {
+                    display_name: u.display_name,
+                    username: u.username,
+                    auth: u.auth,
+                    imap_host: u.imap_host,
+                    imap_port: u.imap_port,
+                    smtp_host: u.smtp_host,
+                    smtp_port: u.smtp_port,
+                    smtp_security: u.smtp_security,
+                    save_sent: u.save_sent,
+                    remove_by: u.remove_by,
+                    trash_mailbox: u.trash_mailbox,
+                    position: u.position,
+                },
             )
-        };
-        self.app
-            .forget(&account.id)
-            .await;
-        let idx = self
-            .app
-            .config
-            .read()
             .await
-            .index_of(&account.id)
             .map_err(fail)?;
-        let mut out = json!({ "updated": account_json(&account, idx) });
-        if changed_auth {
+        let mut out = json!({ "updated": account_json(&updated.account, updated.index) });
+        if auth_changed {
             out["next_step"] = json!("authentication method changed; call login");
         }
         done(out)
@@ -1021,26 +681,9 @@ impl EmailServer {
         &self,
         Parameters(RequiredAccountArg { account }): Parameters<RequiredAccountArg>,
     ) -> ToolResult {
-        let (removed, store) = {
-            let mut cfg = self
-                .app
-                .config
-                .write()
-                .await;
-            let idx = cfg
-                .index_of(&account)
-                .map_err(fail)?;
-            let removed = cfg
-                .accounts
-                .remove(idx);
-            cfg.save()
-                .map_err(fail)?;
-            (removed, cfg.secret_store)
-        };
-        self.app
-            .forget(&removed.id)
-            .await;
-        secrets::delete_all(store, &removed.id)
+        let removed = self
+            .engine
+            .remove_account(&account)
             .await
             .map_err(fail)?;
         done(json!({ "removed": removed.id, "email": removed.email }))
@@ -1051,105 +694,19 @@ impl EmailServer {
         For Gmail OAuth accounts, this returns a Google sign-in URL (and tries to open it in the browser); finish signing in there, then check account_status."
     )]
     async fn login(&self, Parameters(l): Parameters<LoginArgs>) -> ToolResult {
-        let account = self
-            .app
-            .account(Some(&l.account))
+        let (account, start) = self
+            .engine
+            .login(&l.account, l.password)
             .await
             .map_err(fail)?;
-        let store = self
-            .app
-            .config
-            .read()
-            .await
-            .secret_store;
-        self.app
-            .forget(&account.id)
-            .await;
-
-        match account.auth {
-            AuthMethod::Password => {
-                let pw = l
-                    .password
-                    .filter(|p| !p.is_empty())
-                    .ok_or("password is required for this account")?;
-                // Verify before storing so a typo doesn't replace a working password.
-                let session = imap::connect(&account, &imap::Credential::Password(pw.clone()))
-                    .await
-                    .map_err(|e| {
-                        let hint = match account.provider {
-                            Provider::Icloud => " (iCloud requires an app-specific password, not your Apple ID password)",
-                            Provider::Gmail => " (Gmail requires an app password with 2-Step Verification enabled, or use auth=oauth2)",
-                            Provider::Custom => "",
-                        };
-                        format!("{e:#}{hint}")
-                    })?;
-                imap::logout(session).await;
-                secrets::set(store, &account.id, SecretKind::Password, pw)
-                    .await
-                    .map_err(fail)?;
-                done(json!({ "account": account.id, "logged_in": true }))
-            }
-            AuthMethod::Oauth2 => {
-                let client = self
-                    .app
-                    .oauth_client()
-                    .await
-                    .map_err(fail)?;
-                let pending = oauth::begin_login(&client, &account.email)
-                    .await
-                    .map_err(fail)?;
-                let url = pending
-                    .auth_url
-                    .clone();
-                self.app
-                    .logins
-                    .lock()
-                    .await
-                    .insert(
-                        account
-                            .id
-                            .clone(),
-                        LoginState::Waiting {
-                            auth_url: url.clone(),
-                        },
-                    );
-
-                let app = self
-                    .app
-                    .clone();
-                let id = account
-                    .id
-                    .clone();
-                tokio::spawn(async move {
-                    let outcome = async {
-                        let (refresh, access) = pending
-                            .complete(&client)
-                            .await?;
-                        secrets::set(store, &id, SecretKind::OauthRefreshToken, refresh).await?;
-                        app.cache_token(&id, access)
-                            .await;
-                        anyhow::Ok(())
-                    }
-                    .await;
-                    let mut logins = app
-                        .logins
-                        .lock()
-                        .await;
-                    match outcome {
-                        Ok(()) => {
-                            logins.remove(&id);
-                        }
-                        Err(e) => {
-                            logins.insert(id, LoginState::Failed(format!("{e:#}")));
-                        }
-                    }
-                });
-
-                open_browser(&url);
+        match start {
+            LoginStart::LoggedIn => done(json!({ "account": account.id, "logged_in": true })),
+            LoginStart::BrowserSignIn { auth_url } => {
+                open_browser(&auth_url);
                 done(json!({
                     "account": account.id,
                     "status": "waiting_for_browser_sign_in",
-                    "auth_url": url,
+                    "auth_url": auth_url,
                     "instructions": format!(
                         "Open the URL and sign in as {}. The sign-in completes automatically; it expires in {} minutes. Then call account_status.",
                         account.email, oauth::LOGIN_TIMEOUT.as_secs() / 60
@@ -1167,20 +724,8 @@ impl EmailServer {
         Parameters(RequiredAccountArg { account }): Parameters<RequiredAccountArg>,
     ) -> ToolResult {
         let account = self
-            .app
-            .account(Some(&account))
-            .await
-            .map_err(fail)?;
-        let store = self
-            .app
-            .config
-            .read()
-            .await
-            .secret_store;
-        self.app
-            .forget(&account.id)
-            .await;
-        secrets::delete_all(store, &account.id)
+            .engine
+            .logout(&account)
             .await
             .map_err(fail)?;
         done(json!({ "account": account.id, "logged_in": false }))
@@ -1190,59 +735,21 @@ impl EmailServer {
         description = "Show whether accounts are logged in, any pending OAuth sign-in, and optionally test IMAP/SMTP connectivity."
     )]
     async fn account_status(&self, Parameters(a): Parameters<StatusArgs>) -> ToolResult {
-        let (accounts, store) = {
-            let cfg = self
-                .app
-                .config
-                .read()
-                .await;
-            let list = match &a.account {
-                Some(k) => vec![
-                    cfg.find(Some(k))
-                        .map_err(fail)?
-                        .clone(),
-                ],
-                None => cfg
-                    .accounts
-                    .clone(),
-            };
-            (list, cfg.secret_store)
-        };
-        let mut out = vec![];
-        for acct in accounts {
-            let kind = match acct.auth {
-                AuthMethod::Password => SecretKind::Password,
-                AuthMethod::Oauth2 => SecretKind::OauthRefreshToken,
-            };
-            let has_secret = secrets::get(store, &acct.id, kind).await;
-            let mut v = json!({
-                "account": acct.id,
-                "email": acct.email,
-                "auth": acct.auth,
-                "logged_in": match &has_secret { Ok(s) => json!(s.is_some()), Err(e) => json!(format!("error reading secret store: {e:#}")) },
-            });
-            if let Some(state) = self
-                .app
-                .logins
-                .lock()
-                .await
-                .get(&acct.id)
-            {
-                v["pending_login"] = match state {
-                    LoginState::Waiting { auth_url } => {
-                        json!({ "status": "waiting", "auth_url": auth_url })
-                    }
-                    LoginState::Failed(e) => json!({ "status": "failed", "error": e }),
-                };
-            }
-            if a.test_connection && matches!(has_secret, Ok(Some(_))) {
-                v["connection"] = self
-                    .verify(&acct)
-                    .await;
-            }
-            out.push(v);
-        }
-        done(json!(out))
+        let statuses = self
+            .engine
+            .status(
+                a.account
+                    .as_deref(),
+                a.test_connection,
+            )
+            .await
+            .map_err(fail)?;
+        done(json!(
+            statuses
+                .iter()
+                .map(status_json)
+                .collect::<Vec<_>>()
+        ))
     }
 
     #[tool(
@@ -1253,22 +760,9 @@ impl EmailServer {
         &self,
         Parameters(c): Parameters<OauthClientArgs>,
     ) -> ToolResult {
-        let mut cfg = self
-            .app
-            .config
-            .write()
-            .await;
-        cfg.google_oauth = Some(GoogleOauthClient {
-            client_id: c
-                .client_id
-                .trim()
-                .to_owned(),
-            client_secret: c
-                .client_secret
-                .trim()
-                .to_owned(),
-        });
-        cfg.save()
+        self.engine
+            .set_google_oauth_client(&c.client_id, &c.client_secret)
+            .await
             .map_err(fail)?;
         done(json!({ "google_oauth_client_configured": true }))
     }
@@ -1280,39 +774,33 @@ impl EmailServer {
     )]
     async fn list_mailboxes(&self, Parameters(a): Parameters<ListMailboxesArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
+            .await?;
+        let boxes = self
+            .engine
+            .list_mailboxes(&account, a.with_counts)
             .await
             .map_err(fail)?;
-        self.app
-            .with_session(&account, None, async |s| {
-                let boxes = imap::list_mailboxes(s).await?;
-                let mut out = vec![];
-                for b in boxes {
-                    let mut v = json!({
-                        "name": b.name,
-                        "special_use": b.special.map(|k| format!("{k:?}").to_lowercase()),
-                    });
-                    if !b.selectable {
-                        v["selectable"] = json!(false);
-                    } else if a.with_counts
-                        && let Ok(st) = s
-                            .status(&b.name, "(MESSAGES UNSEEN)")
-                            .await
-                    {
-                        v["messages"] = json!(st.exists);
-                        v["unread"] = json!(st.unseen);
-                    }
-                    out.push(v);
+        let out: Vec<_> = boxes
+            .iter()
+            .map(|b| {
+                let mut v = json!({
+                    "name": b.name,
+                    "special_use": b.special_use.map(|k| format!("{k:?}").to_lowercase()),
+                });
+                if !b.selectable {
+                    v["selectable"] = json!(false);
+                } else if let Some(c) = b.counts {
+                    v["messages"] = json!(c.messages);
+                    v["unread"] = json!(c.unread);
                 }
-                Ok(json!({ "account": account.id, "mailboxes": out }))
+                v
             })
-            .await
-            .map_err(fail)
-            .and_then(done)
+            .collect();
+        done(json!({ "account": account.id, "mailboxes": out }))
     }
 
     #[tool(
@@ -1320,18 +808,13 @@ impl EmailServer {
     )]
     async fn create_mailbox(&self, Parameters(a): Parameters<MailboxArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
-        self.app
-            .with_session(&account, None, async |s| {
-                Ok(s.create(&a.name)
-                    .await?)
-            })
+            .await?;
+        self.engine
+            .create_mailbox(&account, &a.name)
             .await
             .map_err(fail)?;
         done(json!({ "created": a.name }))
@@ -1339,24 +822,14 @@ impl EmailServer {
 
     #[tool(description = "Delete a mailbox (folder) and all messages in it.")]
     async fn delete_mailbox(&self, Parameters(a): Parameters<MailboxArgs>) -> ToolResult {
-        if a.name
-            .eq_ignore_ascii_case("INBOX")
-        {
-            return Err("refusing to delete INBOX".into());
-        }
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
-        self.app
-            .with_session(&account, None, async |s| {
-                Ok(s.delete(&a.name)
-                    .await?)
-            })
+            .await?;
+        self.engine
+            .delete_mailbox(&account, &a.name)
             .await
             .map_err(fail)?;
         done(json!({ "deleted": a.name }))
@@ -1365,18 +838,13 @@ impl EmailServer {
     #[tool(description = "Rename a mailbox (folder).")]
     async fn rename_mailbox(&self, Parameters(a): Parameters<RenameMailboxArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
-        self.app
-            .with_session(&account, None, async |s| {
-                Ok(s.rename(&a.name, &a.new_name)
-                    .await?)
-            })
+            .await?;
+        self.engine
+            .rename_mailbox(&account, &a.name, &a.new_name)
             .await
             .map_err(fail)?;
         done(json!({ "renamed": a.name, "to": a.new_name }))
@@ -1389,39 +857,23 @@ impl EmailServer {
     )]
     async fn list_messages(&self, Parameters(a): Parameters<ListMessagesArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
+            .await?;
+        let page = self
+            .engine
+            .list_messages(&account, &a.mailbox, a.unread_only, a.offset, a.limit)
             .await
             .map_err(fail)?;
-        let query = if a.unread_only { "UNSEEN" } else { "ALL" };
-        self.app
-            .with_session(&account, Some(&a.mailbox), async |s| {
-                let uids = imap::search(s, query).await?;
-                let total = uids.len();
-                let page: Vec<u32> = uids
-                    .into_iter()
-                    .skip(a.offset)
-                    .take(a.limit)
-                    .collect();
-                let msgs: Vec<_> = imap::fetch_summaries(s, &page)
-                    .await?
-                    .iter()
-                    .map(summary_json)
-                    .collect();
-                Ok(json!({
-                    "account": account.id,
-                    "mailbox": a.mailbox,
-                    "total_matching": total,
-                    "offset": a.offset,
-                    "messages": msgs,
-                }))
-            })
-            .await
-            .map_err(fail)
-            .and_then(done)
+        done(json!({
+            "account": account.id,
+            "mailbox": a.mailbox,
+            "total_matching": page.total,
+            "offset": a.offset,
+            "messages": page_json(&page),
+        }))
     }
 
     #[tool(
@@ -1429,89 +881,36 @@ impl EmailServer {
     )]
     async fn search_messages(&self, Parameters(a): Parameters<SearchArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
+            .await?;
+        let criteria = SearchCriteria {
+            from: a.from,
+            to: a.to,
+            subject: a.subject,
+            text: a.text,
+            body: a.body,
+            since: a.since,
+            before: a.before,
+            unread: a.unread,
+            flagged: a.flagged,
+            gmail_query: a.gmail_query,
+            raw: a.raw,
+        };
+        let (query, page) = self
+            .engine
+            .search(&account, &a.mailbox, &criteria, a.limit)
             .await
             .map_err(fail)?;
-        let build = || -> Result<String> {
-            let mut parts: Vec<String> = vec![];
-            for (key, val) in [
-                ("FROM", &a.from),
-                ("TO", &a.to),
-                ("SUBJECT", &a.subject),
-                ("TEXT", &a.text),
-                ("BODY", &a.body),
-            ] {
-                if let Some(v) = val {
-                    parts.push(format!("{key} {}", imap::quote(v)?));
-                }
-            }
-            if let Some(d) = &a.since {
-                parts.push(format!("SINCE {}", imap_date(d)?));
-            }
-            if let Some(d) = &a.before {
-                parts.push(format!("BEFORE {}", imap_date(d)?));
-            }
-            match a.unread {
-                Some(true) => parts.push("UNSEEN".into()),
-                Some(false) => parts.push("SEEN".into()),
-                None => {}
-            }
-            match a.flagged {
-                Some(true) => parts.push("FLAGGED".into()),
-                Some(false) => parts.push("UNFLAGGED".into()),
-                None => {}
-            }
-            if let Some(q) = &a.gmail_query {
-                if account.provider != Provider::Gmail {
-                    bail!("gmail_query only works on Gmail accounts");
-                }
-                parts.push(format!("X-GM-RAW {}", imap::quote(q)?));
-            }
-            if let Some(r) = &a.raw {
-                if r.contains(['\r', '\n']) {
-                    bail!("raw criteria cannot contain line breaks");
-                }
-                parts.push(r.clone());
-            }
-            if parts.is_empty() {
-                parts.push("ALL".into());
-            }
-            let q = parts.join(" ");
-            Ok(if q.is_ascii() {
-                q
-            } else {
-                format!("CHARSET UTF-8 {q}")
-            })
-        };
-        let query = build().map_err(fail)?;
-        self.app
-            .with_session(&account, Some(&a.mailbox), async |s| {
-                let uids = imap::search(s, &query).await?;
-                let total = uids.len();
-                let page: Vec<u32> = uids
-                    .into_iter()
-                    .take(a.limit)
-                    .collect();
-                let msgs: Vec<_> = imap::fetch_summaries(s, &page)
-                    .await?
-                    .iter()
-                    .map(summary_json)
-                    .collect();
-                Ok(json!({
-                    "account": account.id,
-                    "mailbox": a.mailbox,
-                    "query": query,
-                    "total_matching": total,
-                    "messages": msgs,
-                }))
-            })
-            .await
-            .map_err(fail)
-            .and_then(done)
+        done(json!({
+            "account": account.id,
+            "mailbox": a.mailbox,
+            "query": query,
+            "total_matching": page.total,
+            "messages": page_json(&page),
+        }))
     }
 
     #[tool(
@@ -1519,22 +918,14 @@ impl EmailServer {
     )]
     async fn read_message(&self, Parameters(a): Parameters<ReadMessageArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
-        let (raw, flags) = self
-            .app
-            .with_session(&account, Some(&a.mailbox), async |s| {
-                let r = imap::fetch_raw(s, a.uid).await?;
-                if a.mark_read {
-                    imap::store_flags(s, &[a.uid], "+", &["\\Seen".into()]).await?;
-                }
-                Ok(r)
-            })
+            .await?;
+        let fetched = self
+            .engine
+            .fetch_message(&account, &a.mailbox, a.uid, a.mark_read)
             .await
             .map_err(fail)?;
         let max = a
@@ -1542,29 +933,27 @@ impl EmailServer {
             .unwrap_or(20_000);
 
         if a.format == BodyFormat::Raw {
-            let (body, truncated) = truncate(String::from_utf8_lossy(&raw).into_owned(), max);
+            let (body, truncated) =
+                truncate(String::from_utf8_lossy(&fetched.raw).into_owned(), max);
             return done(json!({ "uid": a.uid, "raw": body, "truncated": truncated }));
         }
-        let msg = MessageParser::default()
-            .parse(&raw)
-            .ok_or("could not parse message")?;
+        let view = MessageView::parse(&fetched.raw).map_err(fail)?;
         let body = match a.format {
-            BodyFormat::Html => msg
-                .body_html(0)
-                .map(|h| h.into_owned())
+            BodyFormat::Html => view
+                .html
                 .unwrap_or_default(),
-            _ => compose::best_text(&msg),
+            _ => view.text,
         };
         let (body, truncated) = truncate(body, max);
-        let attachments: Vec<_> = msg
-            .attachments()
-            .enumerate()
-            .map(|(i, p)| {
+        let attachments: Vec<_> = view
+            .attachments
+            .iter()
+            .map(|p| {
                 json!({
-                    "index": i + 1,
-                    "filename": p.attachment_name(),
-                    "content_type": p.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("*"))),
-                    "size": p.contents().len(),
+                    "index": p.index,
+                    "filename": p.filename,
+                    "content_type": p.content_type,
+                    "size": p.size,
                 })
             })
             .collect();
@@ -1572,15 +961,15 @@ impl EmailServer {
             "account": account.id,
             "mailbox": a.mailbox,
             "uid": a.uid,
-            "message_id": msg.message_id(),
-            "from": compose::addresses(msg.from()),
-            "reply_to": compose::addresses(msg.reply_to()),
-            "to": compose::addresses(msg.to()),
-            "cc": compose::addresses(msg.cc()),
-            "subject": msg.subject(),
-            "date": msg.date().map(|d| d.to_rfc3339()),
-            "flags": flags,
-            "has_html": msg.html_part(0).is_some_and(|p| p.is_content_type("text", "html")),
+            "message_id": view.message_id,
+            "from": view.from,
+            "reply_to": view.reply_to,
+            "to": view.to,
+            "cc": view.cc,
+            "subject": view.subject,
+            "date": view.date,
+            "flags": fetched.flags,
+            "has_html": view.has_html,
             "body": body,
             "body_truncated": truncated,
             "attachments": attachments,
@@ -1592,50 +981,27 @@ impl EmailServer {
     )]
     async fn save_attachment(&self, Parameters(a): Parameters<SaveAttachmentArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
+            .await?;
+        let saved = self
+            .engine
+            .save_attachments(
+                &account,
+                &a.mailbox,
+                a.uid,
+                a.index,
+                a.directory
+                    .map(Into::into),
+            )
             .await
             .map_err(fail)?;
-        let raw = self
-            .fetch_parsed(&account, &a.mailbox, a.uid)
-            .await
-            .map_err(fail)?;
-        let msg = MessageParser::default()
-            .parse(&raw)
-            .ok_or("could not parse message")?;
-        let all = compose::attachments_of(&msg);
-        let chosen: Vec<&Attachment> = match a.index {
-            Some(i) => vec![
-                all.get(i.wrapping_sub(1))
-                    .ok_or_else(|| format!("no attachment #{i} (message has {})", all.len()))?,
-            ],
-            None => all
-                .iter()
-                .collect(),
-        };
-        if chosen.is_empty() {
-            return Err("message has no attachments".into());
-        }
-        let dir = match a.directory {
-            Some(d) => std::path::PathBuf::from(d),
-            None => directories::UserDirs::new()
-                .and_then(|u| {
-                    u.download_dir()
-                        .map(|p| p.to_path_buf())
-                })
-                .ok_or("no Downloads directory found; pass `directory`")?,
-        };
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mut saved = vec![];
-        for att in chosen {
-            let path = unique_path(&dir, &safe_filename(&att.filename));
-            std::fs::write(&path, &att.data)
-                .map_err(|e| format!("writing {}: {e}", path.display()))?;
-            saved.push(json!({ "path": path, "size": att.data.len() }));
-        }
+        let saved: Vec<_> = saved
+            .iter()
+            .map(|s| json!({ "path": s.path, "size": s.size }))
+            .collect();
         done(json!({ "saved": saved }))
     }
 
@@ -1644,13 +1010,11 @@ impl EmailServer {
     #[tool(description = "Compose and send a new email.")]
     async fn send_email(&self, Parameters(a): Parameters<SendArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
+            .await?;
         let c = Compose {
             to: a.to,
             cc: a.cc,
@@ -1658,13 +1022,11 @@ impl EmailServer {
             subject: a.subject,
             text: Some(a.body),
             html: a.html,
-            attachments: load_attachments(&a.attachments).map_err(fail)?,
+            attachments: Attachment::from_paths(&a.attachments).map_err(fail)?,
             ..Default::default()
         };
-        self.send_compose(&account, &c, None)
+        self.send_or_draft(&account, &c, false, None)
             .await
-            .map_err(fail)
-            .and_then(done)
     }
 
     #[tool(
@@ -1672,31 +1034,19 @@ impl EmailServer {
     )]
     async fn reply_to_message(&self, Parameters(a): Parameters<ReplyArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
+            .await?;
+        let mut c = self
+            .engine
+            .reply_to(&account, &a.mailbox, a.uid, &a.body, a.html, a.reply_all)
             .await
             .map_err(fail)?;
-        let raw = self
-            .fetch_parsed(&account, &a.mailbox, a.uid)
+        c.attachments = Attachment::from_paths(&a.attachments).map_err(fail)?;
+        self.send_or_draft(&account, &c, a.draft_only, Some((&a.mailbox, a.uid)))
             .await
-            .map_err(fail)?;
-        let orig = MessageParser::default()
-            .parse(&raw)
-            .ok_or("could not parse original message")?;
-        let mut c = compose::reply(&account, &orig, &a.body, a.html, a.reply_all);
-        c.attachments = load_attachments(&a.attachments).map_err(fail)?;
-        if a.draft_only {
-            self.save_draft_compose(&account, &c, None)
-                .await
-        } else {
-            self.send_compose(&account, &c, Some((&a.mailbox, a.uid)))
-                .await
-        }
-        .map_err(fail)
-        .and_then(done)
     }
 
     #[tool(
@@ -1704,31 +1054,26 @@ impl EmailServer {
     )]
     async fn forward_message(&self, Parameters(a): Parameters<ForwardArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
+            .await?;
+        let mut c = self
+            .engine
+            .forward(
+                &account,
+                &a.mailbox,
+                a.uid,
+                a.to,
+                &a.body,
+                a.include_attachments,
+            )
             .await
             .map_err(fail)?;
-        let raw = self
-            .fetch_parsed(&account, &a.mailbox, a.uid)
-            .await
-            .map_err(fail)?;
-        let orig = MessageParser::default()
-            .parse(&raw)
-            .ok_or("could not parse original message")?;
-        let mut c = compose::forward(&orig, a.to, &a.body, a.include_attachments);
         c.cc = a.cc;
-        if a.draft_only {
-            self.save_draft_compose(&account, &c, None)
-                .await
-        } else {
-            self.send_compose(&account, &c, None)
-                .await
-        }
-        .map_err(fail)
-        .and_then(done)
+        self.send_or_draft(&account, &c, a.draft_only, None)
+            .await
     }
 
     #[tool(
@@ -1736,13 +1081,11 @@ impl EmailServer {
     )]
     async fn save_draft(&self, Parameters(a): Parameters<DraftArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
+            .await?;
         let c = Compose {
             to: a.to,
             cc: a.cc,
@@ -1750,49 +1093,32 @@ impl EmailServer {
             subject: a.subject,
             text: Some(a.body),
             html: a.html,
-            attachments: load_attachments(&a.attachments).map_err(fail)?,
+            attachments: Attachment::from_paths(&a.attachments).map_err(fail)?,
             ..Default::default()
         };
-        self.save_draft_compose(&account, &c, a.replace_uid)
+        let mailbox = self
+            .engine
+            .save_draft(&account, &c, a.replace_uid)
             .await
-            .map_err(fail)
-            .and_then(done)
+            .map_err(fail)?;
+        done(draft_json(&mailbox, a.replace_uid, &c))
     }
 
     #[tool(description = "Send an existing draft from the Drafts mailbox, then remove the draft.")]
     async fn send_draft(&self, Parameters(a): Parameters<SendDraftArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
+            .await?;
+        let (c, report, removed) = self
+            .engine
+            .send_draft(&account, a.uid)
             .await
             .map_err(fail)?;
-        let drafts = self
-            .resolve_mailbox(&account, "drafts")
-            .await
-            .map_err(fail)?;
-        let raw = self
-            .fetch_parsed(&account, &drafts, a.uid)
-            .await
-            .map_err(fail)?;
-        let msg = MessageParser::default()
-            .parse(&raw)
-            .ok_or("could not parse draft")?;
-        let c = compose::from_draft(&msg);
-        let mut result = self
-            .send_compose(&account, &c, None)
-            .await
-            .map_err(fail)?;
-        let removed = self
-            .app
-            .with_session(&account, Some(&drafts), async |s| {
-                imap::store_flags(s, &[a.uid], "+", &["\\Deleted".into()]).await?;
-                imap::expunge_uids(s, &[a.uid]).await
-            })
-            .await;
-        result["draft_removed"] = json!(removed.is_ok());
+        let mut result = sent_json(&account, &c, &report);
+        result["draft_removed"] = json!(removed);
         done(result)
     }
 
@@ -1803,33 +1129,17 @@ impl EmailServer {
     )]
     async fn update_flags(&self, Parameters(a): Parameters<FlagArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
+            .await?;
+        let (added, removed) = self
+            .engine
+            .update_flags(&account, &a.mailbox, &a.uids, &a.add, &a.remove)
             .await
             .map_err(fail)?;
-        let add = a
-            .add
-            .iter()
-            .map(|f| imap_flag(f))
-            .collect::<Result<Vec<_>>>()
-            .map_err(fail)?;
-        let remove = a
-            .remove
-            .iter()
-            .map(|f| imap_flag(f))
-            .collect::<Result<Vec<_>>>()
-            .map_err(fail)?;
-        self.app
-            .with_session(&account, Some(&a.mailbox), async |s| {
-                imap::store_flags(s, &a.uids, "+", &add).await?;
-                imap::store_flags(s, &a.uids, "-", &remove).await
-            })
-            .await
-            .map_err(fail)?;
-        done(json!({ "uids": a.uids, "added": add, "removed": remove }))
+        done(json!({ "uids": a.uids, "added": added, "removed": removed }))
     }
 
     #[tool(
@@ -1837,21 +1147,14 @@ impl EmailServer {
     )]
     async fn move_messages(&self, Parameters(a): Parameters<MoveArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
+            .await?;
         let dest = self
-            .resolve_mailbox(&account, &a.destination)
-            .await
-            .map_err(fail)?;
-        self.app
-            .with_session(&account, Some(&a.mailbox), async |s| {
-                imap::move_messages(s, &a.uids, &dest).await
-            })
+            .engine
+            .move_messages(&account, &a.mailbox, &a.uids, &a.destination)
             .await
             .map_err(fail)?;
         done(json!({ "moved": a.uids, "from": a.mailbox, "to": dest }))
@@ -1860,22 +1163,14 @@ impl EmailServer {
     #[tool(description = "Copy messages to another mailbox (for Gmail, this adds a label).")]
     async fn copy_messages(&self, Parameters(a): Parameters<MoveArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
+            .await?;
         let dest = self
-            .resolve_mailbox(&account, &a.destination)
-            .await
-            .map_err(fail)?;
-        self.app
-            .with_session(&account, Some(&a.mailbox), async |s| {
-                Ok(s.uid_copy(imap::uid_set(&a.uids), &dest)
-                    .await?)
-            })
+            .engine
+            .copy_messages(&account, &a.mailbox, &a.uids, &a.destination)
             .await
             .map_err(fail)?;
         done(json!({ "copied": a.uids, "from": a.mailbox, "to": dest }))
@@ -1888,18 +1183,13 @@ impl EmailServer {
     )]
     async fn delete_messages(&self, Parameters(a): Parameters<DeleteArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
-        self.app
-            .with_session(&account, Some(&a.mailbox), async |s| {
-                imap::store_flags(s, &a.uids, "+", &["\\Deleted".into()]).await?;
-                imap::expunge_uids(s, &a.uids).await
-            })
+            .await?;
+        self.engine
+            .delete_messages(&account, &a.mailbox, &a.uids)
             .await
             .map_err(fail)?;
         done(json!({ "deleted_permanently": a.uids, "mailbox": a.mailbox }))
@@ -1908,45 +1198,13 @@ impl EmailServer {
     #[tool(description = "Gmail only: add or remove labels on messages without moving them.")]
     async fn gmail_labels(&self, Parameters(a): Parameters<LabelArgs>) -> ToolResult {
         let account = self
-            .app
             .account(
                 a.account
                     .as_deref(),
             )
-            .await
-            .map_err(fail)?;
-        if account.provider != Provider::Gmail {
-            return Err(format!("account '{}' is not a Gmail account", account.id));
-        }
-        let quote_all = |ls: &[String]| -> Result<String> {
-            Ok(ls
-                .iter()
-                .map(|l| imap::quote(l))
-                .collect::<Result<Vec<_>>>()?
-                .join(" "))
-        };
-        let add = quote_all(&a.add).map_err(fail)?;
-        let remove = quote_all(&a.remove).map_err(fail)?;
-        self.app
-            .with_session(&account, Some(&a.mailbox), async |s| {
-                use futures::TryStreamExt;
-                let set = imap::uid_set(&a.uids);
-                if !add.is_empty() {
-                    let _: Vec<_> = s
-                        .uid_store(&set, format!("+X-GM-LABELS.SILENT ({add})"))
-                        .await?
-                        .try_collect()
-                        .await?;
-                }
-                if !remove.is_empty() {
-                    let _: Vec<_> = s
-                        .uid_store(&set, format!("-X-GM-LABELS.SILENT ({remove})"))
-                        .await?
-                        .try_collect()
-                        .await?;
-                }
-                Ok(())
-            })
+            .await?;
+        self.engine
+            .gmail_labels(&account, &a.mailbox, &a.uids, &a.add, &a.remove)
             .await
             .map_err(fail)?;
         done(json!({ "uids": a.uids, "added": a.add, "removed": a.remove }))
@@ -1973,6 +1231,8 @@ impl ServerHandler for EmailServer {
 
 #[cfg(test)]
 mod tests {
+    use email_engine::config::provider_defaults;
+
     use super::*;
 
     fn account(remove_by: RemoveBy, trash: Option<&str>) -> Account {
@@ -2010,5 +1270,19 @@ mod tests {
         assert!(g.contains("destination=\"trash\""), "{g}");
         let g = remove_guidance(&account(RemoveBy::Delete, None));
         assert!(g.starts_with("Remove messages with delete_messages"), "{g}");
+    }
+
+    #[test]
+    fn account_json_marks_only_the_first_account_default() {
+        let a = account(RemoveBy::MoveToTrash, None);
+        assert_eq!(account_json(&a, 0)["default"], json!(true));
+        assert_eq!(account_json(&a, 1)["default"], json!(false));
+        assert_eq!(account_json(&a, 0)["imap"], json!("imap.mail.me.com:993"));
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        assert_eq!(truncate("héllo".into(), 10), ("héllo".into(), false));
+        assert_eq!(truncate("héllo".into(), 2), ("hé".into(), true));
     }
 }
