@@ -7,7 +7,7 @@
   contact: "jfernand@me.com",
   date: "2026-10-22",
   docid: "ISSS-TR-0503",
-  running: "email-mcp — Local Cache & Command Queue (design draft, rev 2)",
+  running: "email-mcp — Local Cache & Command Queue (design draft, rev 3)",
   abstract: [
     #cd[email-mcp] is an MCP server that lets an agent read, write and organize mail across
     several IMAP/SMTP accounts. Every tool currently talks to the server directly: listing a
@@ -22,7 +22,7 @@
   ],
   meta: (
     ("Status", [Draft for review — not scheduled for implementation]),
-    ("Revision", [2 (2026-10-22) — see § 1.3]),
+    ("Revision", [3 (2026-10-22) — see § 1.3]),
     ("Components", [#cd[yabiir] 0.5.0 → 0.6.0; new #cd[yabiir-tables] 0.1.0; #cd[email-mcp] 0.1.0]),
     ("Decisions", [Review Q&A on 2026-10-21 and 2026-10-22 — see § 1.2]),
   ),
@@ -61,6 +61,8 @@ if it fails for good.
   ([Processes], [#key[One email-mcp at a time]. A shared daemon is the near-term follow-up (§ 7).]),
   ([Queue UX], [Apply locally, enqueue, #key[wait up to ~5 s], then report #cd[done], #cd[failed] or #cd[queued].]),
   ([Cache scope], [#key[Headers and flags] for mailboxes as they are used; a #key[body is stored the first time it is read].]),
+  ([Message storage], [Three tables per message: an #key[immutable envelope] of parsed fields, a #key[small mutable flags record], and the #key[raw body]. Everything else is derived from the raw body (§ 4.3).]),
+  ([Indexes], [None in v1: local search scans a mailbox. #key[Secondary indexes may be needed later] (§ 4.4).]),
 )
 
 == Changes since revision 1
@@ -70,6 +72,7 @@ if it fails for good.
   ("Rev", "Date", "Change"),
   ([1], [2026-10-21], [First draft: one store; yabiir gains atomic batches, ordered keydir and per-record compression (format v2).]),
   ([2], [2026-10-22], [Two stores (cache, queue). New #cd[yabiir-tables] crate with tables, key encoding and per-table codecs. yabiir keeps only the ordered keydir. Batches dropped in favour of write ordering; compression moved to the table layer. Tables identified in keys by numeric ids from the catalog.]),
+  ([3], [2026-10-22], [#cd[messages] split into #cd[envelopes] (immutable, parsed and decoded fields) and #cd[flags] (mutable); the summary fetch grows to cover them. Bodies stay raw, with an optional derived #cd[text] table and an optional body-cache size cap. Note that secondary indexes may be needed later.]),
 )
 
 == What exists today
@@ -270,8 +273,10 @@ pub enum Compress { None, Lz4 { min_size: usize } }
   ("Table", "Key", "Value", "Codec"),
   ([#cd[mailboxes]], [#cd[(acct, mailbox)]], [#cd[MailboxState { uidvalidity, uidnext, highest_modseq, exists, unread, special_use, last_sync }]], [json]),
   ([#cd[mailbox_list]], [#cd[(acct)]], [`Vec<MailboxInfo>` — the cached LIST], [json]),
-  ([#cd[messages]], [#cd[(acct, mailbox, uidv: u32, uid: u32)]], [#cd[MessageMeta { flags, size, internal_date, from, to, cc, subject, date, message_id, modseq }]], [json + lz4]),
-  ([#cd[bodies]], [#cd[(acct, mailbox, uidv, uid)]], [Raw RFC 822 bytes], [raw + lz4]),
+  ([#cd[envelopes]], [#cd[(acct, mailbox, uidv: u32, uid: u32)]], [#cd[Envelope] (§ 4.3). Written once per message.], [json + lz4]),
+  ([#cd[flags]], [same], [#cd[FlagState { flags, modseq, gmail_labels }]. Small; rewritten on every flag change.], [postcard]),
+  ([#cd[bodies]], [same], [Raw RFC 822 bytes. Written once, on first read.], [raw + lz4]),
+  ([#cd[text] #hot[optional]], [same], [Plain text extracted from the body at first read, for local body search.], [raw + lz4]),
 )
 
 #key[Queue store]
@@ -283,13 +288,80 @@ pub enum Compress { None, Lz4 { min_size: usize } }
 )
 
 lz4 tables use #cd[min_size = 512]. The next #cd[seq] comes from a reverse scan with limit 1 at
-startup. Newest-first listing is one query:
-#cd[messages.prefix(prefix!(acct, mbox, uidv)).reverse().limit(20)].
+startup. Newest-first listing is a prefix query on #cd[envelopes]
+(#cd[prefix!(acct, mbox, uidv)], reverse, limit 20) plus one #cd[flags] get per row; listing
+is in UID order, which is roughly arrival order.
 
 #callout(kind: "note", "Why UIDVALIDITY is in the key")[
   A UID only identifies a message together with its mailbox's UIDVALIDITY. Putting it in the key
   means a UIDVALIDITY change can never make a stale entry look current — the old entries simply
   live under a prefix nothing reads.
+]
+
+== What is stored per message <sec-message>
+
+#codepanel(title: "Envelope — immutable, parsed at fetch time")[
+```rust
+struct Envelope {
+    message_id: Option<String>,
+    date: Option<i64>,            // Date header, UTC seconds
+    internal_date: i64,           // server arrival time
+    size: u32,                    // RFC822.SIZE
+    from: Vec<Addr>, to: Vec<Addr>, cc: Vec<Addr>, bcc: Vec<Addr>,
+    reply_to: Vec<Addr>,
+    subject: String,              // RFC 2047-decoded
+    in_reply_to: Option<String>,
+    references: Vec<String>,
+    attachments: u16,             // counted from BODYSTRUCTURE
+    gmail: Option<GmailIds>,      // X-GM-MSGID, X-GM-THRID
+}
+struct Addr { name: Option<String>, email: String }   // email lower-cased for matching
+struct FlagState { flags: Vec<String>, modseq: Option<u64>, gmail_labels: Vec<String> }
+```
+]
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Field(s)", "Needed by"),
+  ([#cd[from], #cd[to], #cd[cc], #cd[subject], #cd[date]], [Listing, and local #cd[search_messages] criteria. Stored #key[parsed and decoded] — raw header strings would not match by display name, case-insensitively, or through #cd[=?UTF-8?…?=] encoding.]),
+  ([#cd[reply_to], #cd[in_reply_to], #cd[references], #cd[message_id]], [#cd[reply_to_message] and #cd[forward_message] headers, threading, and the duplicate check for re-run #cd[Copy] / #cd[Append] (§ 4.1).]),
+  ([#cd[bcc]], [Sent and Drafts messages.]),
+  ([#cd[attachments]], ["Has attachment" in listings and search.]),
+  ([#cd[gmail]], [Gmail threads and labels.]),
+)
+
+#callout(kind: "ok", "Why envelopes and flags are separate tables")[
+  yabiir is append-only: every update writes a whole new copy of the value. With one combined
+  record, marking 500 messages read would rewrite 500 compressed envelopes of about 1 KB each.
+  Split, a #cd[SetFlags] — queued, replayed, or picked up by #cd[CHANGEDSINCE] — writes only the
+  tiny #cd[flags] records, and envelopes are written exactly once.
+]
+
+#key[Bodies stay raw.] The raw RFC 822 message is the only representation that can rebuild every
+other view, so text, HTML and the attachment list are derived from it on each read with
+mail-parser, as #cd[read_message] does today. Two optional additions:
+
+- #key[#cd[text] table] — plain text extracted once at first read, so body-text search can run
+  locally instead of going to the server.
+- #key[Body-cache size cap] — raw bodies include attachments, so a 20 MB attachment is a 20 MB
+  cached body. A configurable cap (e.g. #cd[max_body_cache_mb]) evicting least-recently-read
+  bodies keeps the cache bounded; envelopes and flags are never evicted. Messages above a size
+  threshold can also simply skip the body cache.
+
+== Search and indexes <sec-indexes>
+
+In v1 a local search #key[scans one mailbox]: a prefix query over its #cd[envelopes], joined
+with #cd[flags], filtered in memory. For the 16,720-message INBOX that is about 16k small
+records — expected to be tens of milliseconds, to be confirmed by measurement.
+
+#callout(kind: "info", "Indexes may be needed in the future")[
+  If scans prove too slow — very large mailboxes, cross-mailbox search, or frequent
+  date-range and unread queries — #key[secondary indexes] can be added as ordinary tables in the
+  cache store, e.g. #cd[by_date (acct, mbox, date, uid)], #cd[by_sender (acct, email, mbox, uid)]
+  and #cd[unread (acct, mbox, uid)]. They are maintained by the same idempotent writes as the
+  primary tables and, like the rest of the cache, can be rebuilt from scratch. Whether index
+  maintenance belongs in #cd[yabiir-tables] (declared indexes) or in email-mcp is left open
+  until a need is measured.
 ]
 
 == Sync <sec-sync>
@@ -298,15 +370,26 @@ startup. Newest-first listing is one query:
 
 + #cd[select_condstore] when the server advertises CONDSTORE, otherwise #cd[select]\; compare
   UIDVALIDITY with the cached #cd[MailboxState].
-+ #key[New mail:] #cd[UID FETCH {uidnext}:\* SUMMARY_QUERY] (reusing #cd[imap::SUMMARY_QUERY]) in
-  chunks of 500. The first sync of a big mailbox goes newest-first in windows, so listing works
-  almost immediately; older messages backfill in the background.
++ #key[New mail:] #cd[UID FETCH {uidnext}:\*] with an expanded summary query, in chunks of 500,
+  writing #cd[envelopes] and #cd[flags]. The first sync of a big mailbox goes newest-first in
+  windows, so listing works almost immediately; older messages backfill in the background.
 + #key[Flag changes:] with CONDSTORE, #cd[UID FETCH 1:\* (FLAGS) (CHANGEDSINCE modseq)]\; without it,
-  all flags (about 1 MB for 16k messages).
-+ #key[Expunges:] #cd[UID SEARCH ALL] diffed against the cached UIDs; remove what's gone and its body.
+  all flags (about 1 MB for 16k messages). Only #cd[flags] is written.
++ #key[Expunges:] #cd[UID SEARCH ALL] diffed against the cached UIDs; remove what's gone from every
+  message table.
 + #key[Replay] pending commands that touch this mailbox, so a sync never resurrects something the
   agent just deleted.
 + Write #cd[MailboxState] — the checkpoint, always last.
+
+#codepanel(title: "Expanded summary query (today's is at src/imap.rs:185)")[
+```text
+(UID FLAGS MODSEQ RFC822.SIZE INTERNALDATE BODYSTRUCTURE
+ BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC REPLY-TO SUBJECT DATE
+                          MESSAGE-ID IN-REPLY-TO REFERENCES)])
++ X-GM-MSGID X-GM-THRID X-GM-LABELS            on Gmail
+- MODSEQ                                       without CONDSTORE
+```
+]
 
 #key[When it runs.] A read tool syncs first if #cd[last_sync] is older than #cd[freshness_secs]
 (default 60); a #cd[refresh: true] parameter forces it. A background task syncs each account's
@@ -340,10 +423,10 @@ startup replay and during sync:
 #dtable(
   columns: (auto, 1fr),
   ("Op", "Local effect"),
-  ([#cd[SetFlags]], [Edit the cached flags.]),
-  ([#cd[Move]], [Remove meta + body from the source. Nothing in the destination yet — its UID is unknown until the server answers; the destination fills in on its next sync.]),
+  ([#cd[SetFlags]], [Rewrite the #cd[flags] records only.]),
+  ([#cd[Move]], [Remove envelope, flags, body and text from the source. Nothing in the destination yet — its UID is unknown until the server answers; the destination fills in on its next sync.]),
   ([#cd[Copy]], [None until the destination syncs.]),
-  ([#cd[Expunge]], [Remove meta + body.]),
+  ([#cd[Expunge]], [Remove envelope, flags, body and text.]),
   ([#cd[Append]], [None until the mailbox syncs (used for the Sent copy).]),
 )
 
@@ -423,7 +506,7 @@ with injected failures and simulated crashes.
   ([yabiir], [Proptest model with scans; keydir benches for both orders.]),
   ([yabiir-tables], [Key-order property tests; table isolation; codec round-trips; schema mismatch.]),
   ([email-mcp crash ordering], [Kill between queue put and cache apply → replay on reopen repairs the cache. Kill mid-sync → next sync converges. Kill after the IMAP call, before dequeue → no duplicate Copy.]),
-  ([email-mcp unit], [#cd[apply_local] is idempotent; replay never resurrects deleted mail; worker retry / failure paths against the fake.]),
+  ([email-mcp unit], [Envelope parsing: encoded subjects and display names decode, addresses match case-insensitively; a #cd[SetFlags] writes only #cd[flags]; #cd[apply_local] is idempotent; replay never resurrects deleted mail; worker retry / failure paths against the fake.]),
   ([Manual, me.com], [Delete a few messages: they vanish at once, status #cd[done] within seconds, Apple Mail agrees. Network off: #cd[queued], drains after reconnecting. Delete `~/.cache/email-mcp`: nothing queued is lost.]),
 )
 
@@ -444,7 +527,8 @@ with injected failures and simulated crashes.
 - QRESYNC / VANISHED for cheap expunge detection (needs an async-imap extension).
 - Placeholder destination entries so a move shows up in the destination before its sync.
 - An offline SMTP outbox.
-- Body prefetch and LRU eviction.
+- Body prefetch.
+- #key[Secondary indexes] (§ 4.4), if measured scans are too slow.
 - An encryption codec stage in #cd[yabiir-tables].
 - Per-table lz4 dictionaries trained on mail headers.
 - Coalescing queued commands (e.g. a flag set then cleared).
@@ -455,6 +539,6 @@ with injected failures and simulated crashes.
     confirms, or is "applied locally, queued" enough when the 5 s wait expires?
   - Is 60 s the right default freshness, and should it differ per mailbox (INBOX vs archive)?
   - Should #cd[Ordered] stay an option in yabiir, or become the only keydir from 1.0 on?
-  - JSON values (readable with #cd[kv]) or postcard (compact)? The table layer now allows either,
-    per table.
+  - Value formats are now proposed per table — JSON for envelopes, postcard for flags. Agree?
+  - Should the optional #cd[text] table and the body-cache size cap be in v1, or deferred?
 ]
