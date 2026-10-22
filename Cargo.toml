@@ -6,6 +6,7 @@ rust-version = "1.89"
 description = "MCP server for reading, writing, sending and organizing email across multiple IMAP/SMTP accounts (iCloud, Gmail, others)"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/jfernand/email-mcp"
 keywords = ["mcp", "email", "imap", "smtp", "gmail"]
 categories = ["email", "command-line-utilities"]
 include = ["/src", "/tests", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
