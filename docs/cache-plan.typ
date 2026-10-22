@@ -75,7 +75,7 @@ if it fails for good.
   ([1], [2026-10-21], [First draft: one store; yabiir gains atomic batches, ordered keydir and per-record compression (format v2).]),
   ([2], [2026-10-22], [Two stores (cache, queue). New #cd[yabiir-tables] crate with tables, key encoding and per-table codecs. yabiir keeps only the ordered keydir. Batches dropped in favour of write ordering; compression moved to the table layer. Tables identified in keys by numeric ids from the catalog.]),
   ([3], [2026-10-22], [#cd[messages] split into #cd[envelopes] (immutable, parsed and decoded fields) and #cd[flags] (mutable); the summary fetch grows to cover them. Bodies stay raw, with an optional derived #cd[text] table and an optional body-cache size cap. Note that secondary indexes may be needed later.]),
-  ([4], [2026-10-22], [#cd[done] means confirmed by the server and verified by read-back. Worker gains per-command timeouts, a verify step, and verify-before-retry when an outcome is unknown. The ordered keydir becomes yabiir's only keydir. JSON for envelopes, postcard for flags confirmed. Freshness fixed at 60 s for all mailboxes; body-cache cap deferred.]),
+  ([4], [2026-10-22], [#cd[done] means confirmed by the server and verified by read-back. Worker gains per-command timeouts, a verify step, and verify-before-retry when an outcome is unknown. The ordered keydir becomes yabiir's only keydir. JSON for envelopes, postcard for flags confirmed. Freshness fixed at 60 s for all mailboxes; body-cache cap deferred. #cd[text] table in v1, with the local / server / partial rule for body search.]),
 )
 
 == What exists today
@@ -282,7 +282,7 @@ pub enum Compress { None, Lz4 { min_size: usize } }
   ([#cd[envelopes]], [#cd[(acct, mailbox, uidv: u32, uid: u32)]], [#cd[Envelope] (§ 4.3). Written once per message.], [json + lz4]),
   ([#cd[flags]], [same], [#cd[FlagState { flags, modseq, gmail_labels }]. Small; rewritten on every flag change.], [postcard]),
   ([#cd[bodies]], [same], [Raw RFC 822 bytes. Written once, on first read.], [raw + lz4]),
-  ([#cd[text] #hot[optional]], [same], [Plain text extracted from the body at first read, for local body search.], [raw + lz4]),
+  ([#cd[text]], [same], [Plain text extracted from the body at first read, for local body-text search (§ 4.3).], [raw + lz4]),
 )
 
 #key[Queue store]
@@ -345,10 +345,14 @@ struct FlagState { flags: Vec<String>, modseq: Option<u64>, gmail_labels: Vec<St
 
 #key[Bodies stay raw.] The raw RFC 822 message is the only representation that can rebuild every
 other view, so text, HTML and the attachment list are derived from it on each read with
-mail-parser, as #cd[read_message] does today. Two optional additions:
+mail-parser, as #cd[read_message] does today. Two additions:
 
-- #key[#cd[text] table] — plain text extracted once at first read, so body-text search can run
-  locally instead of going to the server.
+- #key[#cd[text] table] (in v1) — when a body is first cached, its plain text is extracted once
+  (the text part, or HTML converted with #cd[html2text] as #cd[read_message] already does;
+  attachments are not indexed) and stored lz4-compressed under the same key. It lives and dies
+  with the body: the same queued ops and expunges remove both. Because bodies are cached only
+  when read, the #cd[text] table covers #key[read messages only] — which shapes how body search
+  works (§ 4.4).
 - #key[Body-cache size cap] #hot[deferred] — raw bodies include attachments, so a 20 MB
   attachment is a 20 MB cached body. A configurable cap (e.g. #cd[max_body_cache_mb]) evicting
   least-recently-read bodies would keep the cache bounded; envelopes and flags would never be
@@ -359,6 +363,21 @@ mail-parser, as #cd[read_message] does today. Two optional additions:
 In v1 a local search #key[scans one mailbox]: a prefix query over its #cd[envelopes], joined
 with #cd[flags], filtered in memory. For the 16,720-message INBOX that is about 16k small
 records — expected to be tens of milliseconds, to be confirmed by measurement.
+
+#key[Body-text search] (#cd[body] / #cd[text] criteria) uses the #cd[text] table, which only
+holds messages that have been read, so a local answer can be incomplete. The rule:
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Situation", "Behaviour"),
+  ([Every candidate message has #cd[text]], [Search locally; the answer is complete.]),
+  ([Some candidates lack #cd[text], server reachable], [Search on the server (#cd[UID SEARCH BODY …]), as today; the server's answer is complete.]),
+  ([Server unreachable or failing], [Search locally and return #cd[{ partial: true, searched: N, of: M }] so the agent can tell the user the result covers only messages already read.]),
+)
+
+Matching is case-insensitive substring over the stored text, like IMAP #cd[SEARCH BODY]. Header,
+flag and date criteria in the same request are applied from #cd[envelopes] and #cd[flags] first,
+so the text scan only touches the candidates.
 
 #callout(kind: "info", "Indexes may be needed in the future")[
   If scans prove too slow — very large mailboxes, cross-mailbox search, or frequent
@@ -494,7 +513,7 @@ applied in the cache but reported as #cd[queued].
   columns: (auto, 1fr),
   ("Tool(s)", "Behaviour with the cache"),
   ([#cd[list_messages], #cd[list_mailboxes], #cd[read_message]], [Served from the cache after a freshness check; #cd[read_message] stores the body on first read. New #cd[refresh] parameter.]),
-  ([#cd[search_messages]], [Header, flag and date criteria run locally. Body-text search and #cd[gmail_query] still go to the server.]),
+  ([#cd[search_messages]], [Header, flag and date criteria run locally. Body-text search runs locally when every candidate's text is cached, otherwise on the server, with a #cd[partial] local answer if the server is unreachable (§ 4.4). #cd[gmail_query] still goes to the server.]),
   ([#cd[update_flags], #cd[move_messages], #cd[copy_messages], #cd[delete_messages]], [Enqueue, wait up to 5 s, return #cd[{ status: done | failed | queued, commands, error? }]. #cd[done] only once the server has confirmed and the read-back agrees (§ 5.3).]),
   ([#cd[send_email], #cd[reply_to_message], #cd[forward_message]], [SMTP directly, as now; the Sent copy is queued.]),
   ([#cd[pending_commands] #hot[new]], [Queued, in-flight and failed commands.]),
@@ -543,7 +562,7 @@ with injected failures and simulated crashes.
   ([email-mcp verification], [Against the fake server: an #cd[OK] that silently drops the change is retried, never reported #cd[done]\; a timeout followed by a change that did apply is confirmed without being re-sent; no duplicate Copy or Append.]),
   ([yabiir-tables], [Key-order property tests; table isolation; codec round-trips; schema mismatch.]),
   ([email-mcp crash ordering], [Kill between queue put and cache apply → replay on reopen repairs the cache. Kill mid-sync → next sync converges. Kill after the IMAP call, before dequeue → no duplicate Copy.]),
-  ([email-mcp unit], [Envelope parsing: encoded subjects and display names decode, addresses match case-insensitively; a #cd[SetFlags] writes only #cd[flags]\; #cd[apply_local] is idempotent; replay never resurrects deleted mail; worker retry / failure paths against the fake.]),
+  ([email-mcp unit], [Envelope parsing: encoded subjects and display names decode, addresses match case-insensitively; a #cd[SetFlags] writes only #cd[flags]\; body search goes local only when all candidates have #cd[text], and is marked #cd[partial] when the server is down\; #cd[apply_local] is idempotent; replay never resurrects deleted mail; worker retry / failure paths against the fake.]),
   ([Manual, me.com], [Delete a few messages: they vanish at once, status #cd[done] within seconds, Apple Mail agrees. Network off: #cd[queued], drains after reconnecting. Delete `~/.cache/email-mcp`: nothing queued is lost.]),
 )
 
@@ -572,7 +591,6 @@ with injected failures and simulated crashes.
 - Coalescing queued commands (e.g. a flag set then cleared).
 - Transactions in #cd[yabiir-tables], if a use ever needs real atomicity.
 
-#callout(kind: "info", "Open for the next review round")[
-  - Should the optional #cd[text] table (local body-text search) be in v1, or deferred like the
-    body-cache cap?
+#callout(kind: "ok", "Review status")[
+  All questions raised in review rounds 1–4 are settled; none are open.
 ]
