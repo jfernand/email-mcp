@@ -34,6 +34,17 @@ pub enum SmtpSecurity {
     Starttls,
 }
 
+/// What delete_messages does by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoveBy {
+    /// Move messages to the Trash mailbox; they can be recovered from there.
+    #[default]
+    MoveToTrash,
+    /// Delete messages permanently (expunge). They cannot be recovered.
+    Delete,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     /// Short unique identifier used to refer to the account in tool calls.
@@ -54,6 +65,13 @@ pub struct Account {
     /// Whether to APPEND a copy of sent mail to the Sent mailbox.
     /// Gmail does this server-side; iCloud and most others do not.
     pub save_sent: bool,
+    /// Remove messages by moving them to Trash or by deleting them permanently.
+    #[serde(default)]
+    pub remove_by: RemoveBy,
+    /// Mailbox that deleted mail goes to, overriding the server's \Trash folder.
+    /// iCloud flags "Deleted Messages", but Apple Mail clients may use "Trash".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_mailbox: Option<String>,
 }
 
 impl Account {
@@ -200,4 +218,34 @@ pub fn validate_id(id: &str) -> Result<()> {
         bail!("account id must be non-empty and contain only letters, digits, '-' or '_'");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_without_new_settings_still_loads() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[account]]
+            id = "me"
+            email = "me@me.com"
+            provider = "icloud"
+            auth = "password"
+            imap_host = "imap.mail.me.com"
+            imap_port = 993
+            smtp_host = "smtp.mail.me.com"
+            smtp_port = 587
+            smtp_security = "starttls"
+            save_sent = true
+            "#,
+        )
+        .unwrap();
+        let a = &cfg.accounts[0];
+        assert_eq!(a.remove_by, RemoveBy::MoveToTrash);
+        assert_eq!(a.trash_mailbox, None);
+        // Unset trash_mailbox is not written back.
+        assert!(!toml::to_string(&cfg).unwrap().contains("trash_mailbox"));
+    }
 }

@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::app::{App, LoginState};
 use crate::compose::{self, Attachment, Compose};
 use crate::config::{
-    Account, AuthMethod, GoogleOauthClient, Provider, SmtpSecurity, guess_provider, provider_defaults,
-    validate_id,
+    Account, AuthMethod, GoogleOauthClient, Provider, RemoveBy, SmtpSecurity, guess_provider,
+    provider_defaults, validate_id,
 };
 use crate::imap::{self, SpecialUse};
 use crate::oauth;
@@ -43,6 +43,10 @@ impl EmailServer {
             app,
             tool_router: Self::tool_router(),
         }
+    }
+
+    pub fn tools(&self) -> Vec<rmcp::model::Tool> {
+        self.tool_router.list_all()
     }
 }
 
@@ -75,6 +79,9 @@ pub struct AddAccountArgs {
     pub smtp_security: Option<SmtpSecurity>,
     /// Save a copy of sent mail to the Sent mailbox (defaults per provider).
     pub save_sent: Option<bool>,
+    /// How to remove messages from this account: move_to_trash (recoverable) or delete (permanent).
+    /// This is guidance returned by list_accounts; the tools themselves never apply it.
+    pub remove_by: Option<RemoveBy>,
     /// 0-based position in the account list; 0 makes it the default. Defaults to the end.
     pub position: Option<usize>,
     /// Password to store and verify immediately (same as calling login afterwards).
@@ -94,6 +101,12 @@ pub struct UpdateAccountArgs {
     pub smtp_port: Option<u16>,
     pub smtp_security: Option<SmtpSecurity>,
     pub save_sent: Option<bool>,
+    /// How to remove messages from this account: move_to_trash (recoverable) or delete (permanent).
+    /// This is guidance returned by list_accounts; the tools themselves never apply it.
+    pub remove_by: Option<RemoveBy>,
+    /// Mailbox that "trash" refers to, instead of the one the server marks as Trash.
+    /// Must already exist. Empty string reverts to the server's choice.
+    pub trash_mailbox: Option<String>,
     /// New 0-based position in the account list; 0 makes it the default.
     pub position: Option<usize>,
 }
@@ -373,9 +386,6 @@ pub struct DeleteArgs {
     #[serde(default = "inbox")]
     pub mailbox: String,
     pub uids: Vec<u32>,
-    /// Permanently delete instead of moving to Trash.
-    #[serde(default)]
-    pub permanent: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -404,7 +414,26 @@ fn account_json(a: &Account, index: usize) -> Value {
         "imap": format!("{}:{}", a.imap_host, a.imap_port),
         "smtp": format!("{}:{} ({:?})", a.smtp_host, a.smtp_port, a.smtp_security),
         "save_sent": a.save_sent,
+        "remove_by": a.remove_by,
+        "trash_mailbox": a.trash_mailbox,
+        "remove_messages": remove_guidance(a),
     })
+}
+
+/// How the agent should remove messages from this account. The tools don't apply
+/// `remove_by` themselves; this text tells the agent which call to make.
+fn remove_guidance(a: &Account) -> String {
+    let trash = a.trash_mailbox.as_deref().unwrap_or("trash");
+    match a.remove_by {
+        RemoveBy::MoveToTrash => format!(
+            "Remove messages with move_messages destination=\"{trash}\". \
+             Use delete_messages only if the user explicitly asks to delete permanently."
+        ),
+        RemoveBy::Delete => format!(
+            "Remove messages with delete_messages (permanent). \
+             Use move_messages destination=\"{trash}\" if the user asks to keep a recoverable copy."
+        ),
+    }
 }
 
 fn summary_json(s: &imap::Summary) -> Value {
@@ -502,6 +531,11 @@ impl EmailServer {
             "drafts" => SpecialUse::Drafts,
             _ => return Ok(name.to_owned()),
         };
+        if kind == SpecialUse::Trash
+            && let Some(t) = &account.trash_mailbox
+        {
+            return Ok(t.clone());
+        }
         self.app
             .with_session(account, None, async |s| {
                 // Prefer an exact mailbox name match before special-use resolution.
@@ -656,6 +690,8 @@ impl EmailServer {
                 .or(defaults.as_ref().map(|d| d.smtp_security))
                 .unwrap_or(SmtpSecurity::Starttls),
             save_sent: a.save_sent.or(defaults.as_ref().map(|d| d.save_sent)).unwrap_or(true),
+            remove_by: a.remove_by.unwrap_or_default(),
+            trash_mailbox: None,
         };
 
         let pos = {
@@ -683,6 +719,17 @@ impl EmailServer {
 
     #[tool(description = "Change an account's settings or its position in the list (position 0 = default account).")]
     async fn update_account(&self, Parameters(u): Parameters<UpdateAccountArgs>) -> ToolResult {
+        if let Some(t) = u.trash_mailbox.as_deref().filter(|t| !t.is_empty()) {
+            let current = self.app.account(Some(&u.account)).await.map_err(fail)?;
+            let boxes = self
+                .app
+                .with_session(&current, None, async |s| imap::list_mailboxes(s).await)
+                .await
+                .map_err(fail)?;
+            if !boxes.iter().any(|b| b.name == t && b.selectable) {
+                return Err(format!("no mailbox named '{t}' on account '{}'", current.id));
+            }
+        }
         let (account, changed_auth) = {
             let mut cfg = self.app.config.write().await;
             let idx = cfg.index_of(&u.account).map_err(fail)?;
@@ -703,6 +750,8 @@ impl EmailServer {
             if let Some(v) = u.smtp_port { a.smtp_port = v; }
             if let Some(v) = u.smtp_security { a.smtp_security = v; }
             if let Some(v) = u.save_sent { a.save_sent = v; }
+            if let Some(v) = u.remove_by { a.remove_by = v; }
+            if let Some(v) = u.trash_mailbox { a.trash_mailbox = Some(v).filter(|s| !s.is_empty()); }
             let pos = u.position.unwrap_or(idx).min(cfg.accounts.len());
             cfg.accounts.insert(pos, a.clone());
             cfg.save().map_err(fail)?;
@@ -1208,29 +1257,19 @@ impl EmailServer {
         done(json!({ "copied": a.uids, "from": a.mailbox, "to": dest }))
     }
 
-    #[tool(description = "Delete messages: moves them to Trash, or permanently deletes them if permanent=true or they are already in Trash.")]
+    #[tool(description = "Permanently delete messages (\\Deleted + expunge); they cannot be recovered. \
+        Before removing messages, follow the account's `remove_messages` guidance from list_accounts: \
+        if it says to move them to trash, call move_messages instead, unless the user explicitly asks to delete permanently.")]
     async fn delete_messages(&self, Parameters(a): Parameters<DeleteArgs>) -> ToolResult {
         let account = self.app.account(a.account.as_deref()).await.map_err(fail)?;
-        let trash = self.resolve_mailbox(&account, "trash").await.ok();
-        let permanent = a.permanent || trash.as_deref() == Some(a.mailbox.as_str());
         self.app
             .with_session(&account, Some(&a.mailbox), async |s| {
-                match (&trash, permanent) {
-                    (Some(t), false) => imap::move_messages(s, &a.uids, t).await,
-                    (None, false) => bail!("no Trash mailbox found; pass permanent=true to delete permanently"),
-                    (_, true) => {
-                        imap::store_flags(s, &a.uids, "+", &["\\Deleted".into()]).await?;
-                        imap::expunge_uids(s, &a.uids).await
-                    }
-                }
+                imap::store_flags(s, &a.uids, "+", &["\\Deleted".into()]).await?;
+                imap::expunge_uids(s, &a.uids).await
             })
             .await
             .map_err(fail)?;
-        done(json!({
-            "deleted": a.uids,
-            "permanently": permanent,
-            "moved_to": if permanent { None } else { trash },
-        }))
+        done(json!({ "deleted_permanently": a.uids, "mailbox": a.mailbox }))
     }
 
     #[tool(description = "Gmail only: add or remove labels on messages without moving them.")]
@@ -1272,7 +1311,45 @@ impl ServerHandler for EmailServer {
                  Every mail tool takes an optional `account` (id or email); omitted means the first, default account. \
                  Messages are identified by mailbox + UID, as returned by list_messages/search_messages. \
                  Set up accounts with add_account then login; check with account_status. \
+                 Each account's settings and how to apply them are returned by list_accounts \
+                 (e.g. `remove_messages` says whether removing means move_messages to trash or delete_messages); \
+                 check them before removing messages, and change them with update_account. \
                  Sending email and deleting messages act on the user's real mailbox, so confirm recipients and content with the user first.",
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(remove_by: RemoveBy, trash: Option<&str>) -> Account {
+        let d = provider_defaults(Provider::Icloud).unwrap();
+        Account {
+            id: "me".into(),
+            email: "me@me.com".into(),
+            display_name: None,
+            provider: Provider::Icloud,
+            auth: d.auth,
+            username: None,
+            imap_host: d.imap_host.into(),
+            imap_port: d.imap_port,
+            smtp_host: d.smtp_host.into(),
+            smtp_port: d.smtp_port,
+            smtp_security: d.smtp_security,
+            save_sent: d.save_sent,
+            remove_by,
+            trash_mailbox: trash.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn remove_guidance_names_the_right_call() {
+        let g = remove_guidance(&account(RemoveBy::MoveToTrash, Some("Trash")));
+        assert!(g.starts_with("Remove messages with move_messages destination=\"Trash\""), "{g}");
+        let g = remove_guidance(&account(RemoveBy::MoveToTrash, None));
+        assert!(g.contains("destination=\"trash\""), "{g}");
+        let g = remove_guidance(&account(RemoveBy::Delete, None));
+        assert!(g.starts_with("Remove messages with delete_messages"), "{g}");
     }
 }

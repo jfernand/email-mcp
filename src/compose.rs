@@ -332,6 +332,8 @@ mod tests {
             smtp_port: 587,
             smtp_security: SmtpSecurity::Starttls,
             save_sent: true,
+            remove_by: Default::default(),
+            trash_mailbox: None,
         }
     }
 
