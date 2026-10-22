@@ -435,7 +435,9 @@ impl Engine {
                     u.download_dir()
                         .map(Path::to_path_buf)
                 })
-                .ok_or_else(|| anyhow!("no Downloads directory found; pass a directory"))?,
+                .ok_or_else(|| {
+                    anyhow!("no Downloads directory found; give a directory to save into")
+                })?,
         };
         std::fs::create_dir_all(&dir)?;
         let mut saved = vec![];

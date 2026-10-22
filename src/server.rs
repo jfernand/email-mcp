@@ -8,7 +8,7 @@ use email_engine::compose::{Attachment, Compose};
 use email_engine::config::{Account, AuthMethod, Provider, RemoveBy, SmtpSecurity};
 use email_engine::messages::{MessagePage, MessageSummary, MessageView, SearchCriteria};
 use email_engine::sending::SendReport;
-use email_engine::{Engine, LoginState, oauth};
+use email_engine::{Engine, LoginState, SetupNeeded, oauth};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -23,8 +23,27 @@ fn done(v: Value) -> ToolResult {
     Ok(serde_json::to_string_pretty(&v).expect("a JSON value always serializes"))
 }
 
+/// The error for the agent. Incomplete setup gets the tool call that fixes it.
 fn fail(e: anyhow::Error) -> String {
-    format!("{e:#}")
+    match e.downcast_ref::<SetupNeeded>() {
+        Some(s) => format!("{e:#}; {}", setup_hint(s)),
+        None => format!("{e:#}"),
+    }
+}
+
+fn setup_hint(s: &SetupNeeded) -> &'static str {
+    match s {
+        SetupNeeded::NoAccounts => "add one with add_account",
+        SetupNeeded::NotLoggedIn {
+            auth: AuthMethod::Password,
+            ..
+        } => "call login with its app password",
+        SetupNeeded::NotLoggedIn {
+            auth: AuthMethod::Oauth2,
+            ..
+        } => "call login to start the Google sign-in",
+        SetupNeeded::NoGoogleOauthClient => "call set_google_oauth_client first",
+    }
 }
 
 #[derive(Clone)]
@@ -1278,6 +1297,34 @@ mod tests {
         assert_eq!(account_json(&a, 0)["default"], json!(true));
         assert_eq!(account_json(&a, 1)["default"], json!(false));
         assert_eq!(account_json(&a, 0)["imap"], json!("imap.mail.me.com:993"));
+    }
+
+    #[test]
+    fn setup_errors_name_the_tool_that_fixes_them() {
+        let e: anyhow::Error = SetupNeeded::NotLoggedIn {
+            account: "me".into(),
+            auth: AuthMethod::Password,
+        }
+        .into();
+        assert_eq!(
+            fail(e.context("listing INBOX")),
+            "listing INBOX: account 'me' is not logged in (no password stored); call login with its app password"
+        );
+        assert_eq!(
+            fail(SetupNeeded::NoGoogleOauthClient.into()),
+            "no Google OAuth client configured; call set_google_oauth_client first"
+        );
+        assert_eq!(fail(anyhow::anyhow!("boom")), "boom");
+    }
+
+    #[tokio::test]
+    async fn engine_setup_errors_reach_the_agent_with_hints() {
+        let server = EmailServer::new(Arc::new(Engine::default()));
+        let err = server
+            .account(None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "no accounts configured; add one with add_account");
     }
 
     #[test]

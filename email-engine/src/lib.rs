@@ -27,6 +27,7 @@ pub mod accounts;
 pub mod compose;
 pub mod config;
 mod engine;
+pub mod error;
 pub mod imap;
 pub mod mailboxes;
 pub mod messages;
@@ -37,3 +38,4 @@ pub mod smtp;
 pub mod tls;
 
 pub use engine::{Engine, LoginState};
+pub use error::SetupNeeded;

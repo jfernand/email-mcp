@@ -157,7 +157,7 @@ impl Config {
             None => self
                 .accounts
                 .first()
-                .ok_or_else(|| anyhow!("no accounts configured; use add_account first")),
+                .ok_or_else(|| crate::error::SetupNeeded::NoAccounts.into()),
             Some(k) => self
                 .accounts
                 .iter()

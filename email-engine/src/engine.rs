@@ -1,14 +1,25 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 
 use crate::config::{Account, AuthMethod, Config, GoogleOauthClient, SecretStore};
+use crate::error::SetupNeeded;
 use crate::imap::{self, Credential, Pool, Session};
 use crate::oauth::{self, AccessToken};
 use crate::secrets::{self, SecretKind};
+
+fn not_logged_in(account: &Account) -> anyhow::Error {
+    SetupNeeded::NotLoggedIn {
+        account: account
+            .id
+            .clone(),
+        auth: account.auth,
+    }
+    .into()
+}
 
 /// State of a Google sign-in started by [`Engine::login`] and still finishing in the background.
 #[derive(Debug, Clone)]
@@ -67,12 +78,7 @@ impl Engine {
             AuthMethod::Password => secrets::get(store, &account.id, SecretKind::Password)
                 .await?
                 .map(Credential::Password)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "account '{}' is not logged in; call login with its app password",
-                        account.id
-                    )
-                }),
+                .ok_or_else(|| not_logged_in(account)),
             AuthMethod::Oauth2 => {
                 if let Some(t) = self
                     .tokens
@@ -88,12 +94,7 @@ impl Engine {
                 }
                 let refresh = secrets::get(store, &account.id, SecretKind::OauthRefreshToken)
                     .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "account '{}' is not logged in; call login to start the Google sign-in",
-                            account.id
-                        )
-                    })?;
+                    .ok_or_else(|| not_logged_in(account))?;
                 let client = self
                     .oauth_client()
                     .await?;
@@ -114,9 +115,7 @@ impl Engine {
             .await
             .google_oauth
             .clone()
-            .ok_or_else(|| {
-                anyhow!("no Google OAuth client configured; call set_google_oauth_client first")
-            })
+            .ok_or_else(|| SetupNeeded::NoGoogleOauthClient.into())
     }
 
     pub(crate) async fn cache_token(&self, account_id: &str, token: AccessToken) {
