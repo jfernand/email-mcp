@@ -75,7 +75,7 @@ if it fails for good.
   ([1], [2026-10-21], [First draft: one store; yabiir gains atomic batches, ordered keydir and per-record compression (format v2).]),
   ([2], [2026-10-22], [Two stores (cache, queue). New #cd[yabiir-tables] crate with tables, key encoding and per-table codecs. yabiir keeps only the ordered keydir. Batches dropped in favour of write ordering; compression moved to the table layer. Tables identified in keys by numeric ids from the catalog.]),
   ([3], [2026-10-22], [#cd[messages] split into #cd[envelopes] (immutable, parsed and decoded fields) and #cd[flags] (mutable); the summary fetch grows to cover them. Bodies stay raw, with an optional derived #cd[text] table and an optional body-cache size cap. Note that secondary indexes may be needed later.]),
-  ([4], [2026-10-22], [#cd[done] means confirmed by the server and verified by read-back. Worker gains per-command timeouts, a verify step, and verify-before-retry when an outcome is unknown. The ordered keydir becomes yabiir's only keydir. JSON for envelopes, postcard for flags confirmed.]),
+  ([4], [2026-10-22], [#cd[done] means confirmed by the server and verified by read-back. Worker gains per-command timeouts, a verify step, and verify-before-retry when an outcome is unknown. The ordered keydir becomes yabiir's only keydir. JSON for envelopes, postcard for flags confirmed. Freshness fixed at 60 s for all mailboxes; body-cache cap deferred.]),
 )
 
 == What exists today
@@ -349,10 +349,10 @@ mail-parser, as #cd[read_message] does today. Two optional additions:
 
 - #key[#cd[text] table] — plain text extracted once at first read, so body-text search can run
   locally instead of going to the server.
-- #key[Body-cache size cap] — raw bodies include attachments, so a 20 MB attachment is a 20 MB
-  cached body. A configurable cap (e.g. #cd[max_body_cache_mb]) evicting least-recently-read
-  bodies keeps the cache bounded; envelopes and flags are never evicted. Messages above a size
-  threshold can also simply skip the body cache.
+- #key[Body-cache size cap] #hot[deferred] — raw bodies include attachments, so a 20 MB
+  attachment is a 20 MB cached body. A configurable cap (e.g. #cd[max_body_cache_mb]) evicting
+  least-recently-read bodies would keep the cache bounded; envelopes and flags would never be
+  evicted. Not in v1: the cache grows with what is read, and #cd[cache_status] reports its size.
 
 == Search and indexes <sec-indexes>
 
@@ -398,7 +398,7 @@ records — expected to be tens of milliseconds, to be confirmed by measurement.
 ]
 
 #key[When it runs.] A read tool syncs first if #cd[last_sync] is older than #cd[freshness_secs]
-(default 60); a #cd[refresh: true] parameter forces it. A background task syncs each account's
+(60 s, one value for every mailbox)\; a #cd[refresh: true] parameter forces it. A background task syncs each account's
 INBOX every 5 minutes. The mailbox list is cached with the same freshness rule.
 
 = The command queue <sec-queue>
@@ -564,7 +564,8 @@ with injected failures and simulated crashes.
 - QRESYNC / VANISHED for cheap expunge detection (needs an async-imap extension).
 - Placeholder destination entries so a move shows up in the destination before its sync.
 - An offline SMTP outbox.
-- Body prefetch.
+- Body prefetch, and the body-cache size cap with LRU eviction (§ 4.3).
+- Per-mailbox freshness, if 60 s everywhere proves wrong for large archives.
 - #key[Secondary indexes] (§ 4.4), if measured scans are too slow.
 - An encryption codec stage in #cd[yabiir-tables].
 - Per-table lz4 dictionaries trained on mail headers.
@@ -572,6 +573,6 @@ with injected failures and simulated crashes.
 - Transactions in #cd[yabiir-tables], if a use ever needs real atomicity.
 
 #callout(kind: "info", "Open for the next review round")[
-  - Is 60 s the right default freshness, and should it differ per mailbox (INBOX vs archive)?
-  - Should the optional #cd[text] table and the body-cache size cap be in v1, or deferred?
+  - Should the optional #cd[text] table (local body-text search) be in v1, or deferred like the
+    body-cache cap?
 ]
