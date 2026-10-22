@@ -7,7 +7,7 @@
   contact: "jfernand@me.com",
   date: "2026-10-22",
   docid: "ISSS-TR-0503",
-  running: "email-mcp — Local Cache & Command Queue (design draft, rev 3)",
+  running: "email-mcp — Local Cache & Command Queue (design draft, rev 4)",
   abstract: [
     #cd[email-mcp] is an MCP server that lets an agent read, write and organize mail across
     several IMAP/SMTP accounts. Every tool currently talks to the server directly: listing a
@@ -22,7 +22,7 @@
   ],
   meta: (
     ("Status", [Draft for review — not scheduled for implementation]),
-    ("Revision", [3 (2026-10-22) — see § 1.3]),
+    ("Revision", [4 (2026-10-22) — see § 1.3]),
     ("Components", [#cd[yabiir] 0.5.0 → 0.6.0; new #cd[yabiir-tables] 0.1.0; #cd[email-mcp] 0.1.0]),
     ("Decisions", [Review Q&A on 2026-10-21 and 2026-10-22 — see § 1.2]),
   ),
@@ -54,12 +54,14 @@ if it fails for good.
   columns: (auto, 1fr),
   ("Topic", "Decision"),
   ([Layering], [Most of the work is a #key[layer above the KV store] that exposes #key[tables]: a new crate #cd[yabiir-tables] in the yabiir workspace, published separately.]),
-  ([KV changes], [Only an #key[ordered keydir] with range/prefix scans, as an option. No on-disk format change.]),
+  ([KV changes], [Only an #key[ordered keydir] with range/prefix scans — #key[the only keydir], replacing the hash map, not an option. No on-disk format change.]),
+  ([Value formats], [#key[JSON] (+ lz4) for envelopes and other cache records, #key[postcard] for the frequently rewritten #cd[flags]\; raw for bodies.]),
   ([Stores], [Cache and queue are #key[two directories, two yabiir instances].]),
   ([Atomicity], [#key[No KV batches.] Write ordering instead: the queue is the source of truth, the cache is rebuildable (§ 4.1).]),
   ([Compression], [lz4 (#cd[lz4_flex]) chosen #key[per table] in the table layer.]),
   ([Processes], [#key[One email-mcp at a time]. A shared daemon is the near-term follow-up (§ 7).]),
   ([Queue UX], [Apply locally, enqueue, #key[wait up to ~5 s], then report #cd[done], #cd[failed] or #cd[queued].]),
+  ([Meaning of #cd[done]], [#key[Only after the server has confirmed the change, verified by reading it back] — large providers drop requests often enough that an #cd[OK] alone is not trusted. Locally applied but unconfirmed is #cd[queued], never #cd[done] (§ 5.3).]),
   ([Cache scope], [#key[Headers and flags] for mailboxes as they are used; a #key[body is stored the first time it is read].]),
   ([Message storage], [Three tables per message: an #key[immutable envelope] of parsed fields, a #key[small mutable flags record], and the #key[raw body]. Everything else is derived from the raw body (§ 4.3).]),
   ([Indexes], [None in v1: local search scans a mailbox. #key[Secondary indexes may be needed later] (§ 4.4).]),
@@ -73,6 +75,7 @@ if it fails for good.
   ([1], [2026-10-21], [First draft: one store; yabiir gains atomic batches, ordered keydir and per-record compression (format v2).]),
   ([2], [2026-10-22], [Two stores (cache, queue). New #cd[yabiir-tables] crate with tables, key encoding and per-table codecs. yabiir keeps only the ordered keydir. Batches dropped in favour of write ordering; compression moved to the table layer. Tables identified in keys by numeric ids from the catalog.]),
   ([3], [2026-10-22], [#cd[messages] split into #cd[envelopes] (immutable, parsed and decoded fields) and #cd[flags] (mutable); the summary fetch grows to cover them. Bodies stay raw, with an optional derived #cd[text] table and an optional body-cache size cap. Note that secondary indexes may be needed later.]),
+  ([4], [2026-10-22], [#cd[done] means confirmed by the server and verified by read-back. Worker gains per-command timeouts, a verify step, and verify-before-retry when an outcome is unknown. The ordered keydir becomes yabiir's only keydir. JSON for envelopes, postcard for flags confirmed.]),
 )
 
 == What exists today
@@ -91,7 +94,7 @@ email-mcp      cache store (~/.cache)        queue store (~/.local/share)
                      │                              │
 yabiir-tables   Db ─ Table<K,V> ─ Key encoding ─ ValueCodec (json/postcard/raw, lz4)
                      │                              │
-yabiir 0.6      Engine, KeyOrder::Ordered, scan()   (one instance per directory)
+yabiir 0.6      Engine, ordered keydir, scan()      (one instance per directory)
 ```
 ]
 
@@ -104,8 +107,6 @@ only the keydir knows where keys are.
 
 #codepanel(title: "Proposed API")[
 ```rust
-pub enum KeyOrder { Hashed /* default */, Ordered }
-
 pub struct Scan {
     pub start: Bound<Vec<u8>>,
     pub end: Bound<Vec<u8>>,
@@ -121,21 +122,26 @@ impl Engine {
 ```
 ]
 
-- #cd[Options::key_order] picks the keydir. #cd[Keydir] becomes an enum over the existing ahash
-  #cd[HashMap] and a #cd[BTreeMap], which avoids threading a generic parameter through
-  #cd[Engine], recovery and merge.
+- #key[Ordered is the only keydir.] The ahash #cd[HashMap] in #cd[src/keydir.rs] is replaced
+  by a #cd[BTreeMap]\; there is no #cd[KeyOrder] option and no #cd[Hashed] mode, so #cd[scan] is
+  always available and #cd[ahash] leaves the dependency list. #cd[list_keys] and #cd[fold] now
+  return keys in order as a side effect.
 - The range is snapshotted under the read lock with no I/O — the existing "never hold a lock
   across disk I/O" rule — and values are read afterwards.
-- On a #cd[Hashed] store #cd[scan] returns #cd[Error::Unsupported] rather than silently sorting
-  every key: the cost stays visible.
 - #key[No on-disk format change.] Recovery, hint files and merge are untouched; only the
-  in-memory index differs, so any existing store can be reopened either way.
+  in-memory index differs, so every existing store reopens unchanged.
+
+#callout(kind: "trap", "The cost to measure")[
+  A #cd[BTreeMap] is typically slower than ahash for point #cd[get] / #cd[insert] (log n compares
+  of whole keys instead of one hash) and rebuilding it at open is slower too. Before switching,
+  #cd[benches/keydir.rs] records #cd[get] / #cd[insert] / open-time rebuild for the old hash
+  keydir and the new ordered one, so the regression is known and stated in the 0.6.0 changelog.
+]
 
 #callout(kind: "info", "Side benefit")[
   A #cd[BTreeMap] keydir is exactly the deterministic keydir ROADMAP § 1 asks for before
   deterministic simulation testing. The proptest model in #cd[tests/model.rs] gains scans checked
-  against a reference #cd[BTreeMap], and #cd[benches/keydir.rs] measures #cd[get] / #cd[insert] /
-  #cd[scan] for both orders so the trade-off is on record.
+  against a reference #cd[BTreeMap].
 ]
 
 Release: bump to #cd[0.6.0], update README and ROADMAP, publish.
@@ -151,7 +157,6 @@ own. It is synchronous like yabiir; async callers wrap it in #cd[spawn_blocking]
 ```rust
 pub struct Db { /* one Engine, one directory, one lock */ }
 impl Db {
-    /// Forces KeyOrder::Ordered.
     pub fn open(dir: &Path, opts: Options) -> Result<Db>;
     pub fn table<K: Key, V>(&self, def: &TableDef<K, V>) -> Result<Table<'_, K, V>>;
 }
@@ -254,14 +259,15 @@ pub enum Compress { None, Lz4 { min_size: usize } }
   ([Enqueue], [(1) Put the #cd[Command] in the queue and fsync — #hot[the commit point]. (2) Apply its local effect to the cache. A crash between the two is repaired at startup, when the cache replays every pending command.]),
   ([Sync], [Write fetched messages, flag changes and expunge deletions; replay pending commands for the mailbox; write #cd[MailboxState] #key[last]. #cd[MailboxState] (uidnext, highestmodseq, last_sync) is the checkpoint: after a crash mid-sync, the old checkpoint makes the next sync redo the work, and every write is an idempotent put or delete.]),
   ([UIDVALIDITY change], [Message keys include uidvalidity, so old entries become unreachable the moment the new #cd[MailboxState] is written; they are cleared afterwards with #cd[delete_prefix]. Commands queued against the old value become #cd[Failed].]),
-  ([Worker], [(1) Mark the command #cd[InFlight] (fsync). (2) Execute over IMAP. (3) Delete it. A crash after (2) re-runs the command: #key[at-least-once].]),
+  ([Worker], [(1) Mark the command #cd[InFlight] (fsync). (2) Execute over IMAP. (3) Verify by reading back. (4) Delete it. A crash after (2) leaves the outcome unknown; the command is verified first and re-run only if needed: #key[at-least-once] (§ 5.3).]),
   ([Corruption or #cd[SchemaMismatch]], [Delete the cache directory, replay the queue, sync on demand. The queue is never wiped.]),
 )
 
 #callout(kind: "trap", "At-least-once and duplicates")[
   Re-running #cd[SetFlags], #cd[Move] or #cd[Expunge] is harmless: UID commands ignore UIDs that
-  no longer exist. #cd[Copy] and #cd[Append] could duplicate, so at startup an #cd[InFlight] one
-  first searches the destination for its Message-ID before retrying.
+  no longer exist. #cd[Copy] and #cd[Append] could duplicate, so an #cd[InFlight] one whose
+  outcome is unknown first searches the destination for its Message-ID before retrying — the
+  same check used to verify it (§ 5.3).
 ]
 
 == Tables
@@ -440,10 +446,39 @@ parallel. It runs each command through the existing #cd[imap::\*] functions unde
 #dtable(
   columns: (auto, 1fr),
   ("Outcome", "Action"),
-  ([Success], [Delete the command from the queue; mark the destination mailbox stale in the cache.]),
-  ([Transient error], [Network, timeout, dropped session: back to #cd[Pending], exponential backoff 1 s → 5 min, #cd[attempts += 1].]),
+  ([Confirmed], [The server answered #cd[OK] #key[and] the read-back verification passed: delete the command from the queue, mark the destination mailbox stale, report #cd[done].]),
+  ([Unverified], [#cd[OK] but the read-back disagrees (the request was dropped or only partly applied): treat as transient and retry — every op is safe to repeat once verified.]),
+  ([Transient error], [Network, timeout, dropped session: back to #cd[Pending], exponential backoff 1 s → 5 min, #cd[attempts += 1]. The outcome is unknown, so the next attempt #key[verifies before executing].]),
   ([Permanent error], [#cd[NO] response, UIDVALIDITY mismatch, missing mailbox: mark #cd[Failed], then resync the mailbox so the cache reverts to server truth. Replay skips failed commands.]),
 )
+
+== Confirmation and verification <sec-confirm>
+
+Large providers are known to drop requests: a session stalls, a command never gets a tagged
+response, or an #cd[OK] arrives for a change that does not stick. So #key[#cd[done] means the
+server confirmed the change and a read-back agrees] — nothing less. Until then the change is
+applied in the cache but reported as #cd[queued].
+
+#dtable(
+  columns: (auto, 1fr),
+  ("Op", "Verification (read-back)"),
+  ([#cd[SetFlags]], [#cd[UID FETCH {uids} (FLAGS)]: every UID has the added flags and none of the removed ones.]),
+  ([#cd[Move]], [#cd[UID SEARCH UID {uids}] in the source returns nothing, and the destination's Message-IDs include the moved ones.]),
+  ([#cd[Expunge]], [#cd[UID SEARCH UID {uids}] returns nothing.]),
+  ([#cd[Copy], #cd[Append]], [The destination contains the Message-ID(s) (#cd[UID SEARCH HEADER Message-ID …]).]),
+)
+
+- #key[Timeouts.] Every IMAP command the worker issues has a deadline (default 30 s). On expiry
+  the session is dropped and reopened — a stalled connection never blocks the queue — and the
+  attempt counts as transient with an unknown outcome.
+- #key[Verify before retry.] Whenever an attempt's outcome is unknown (timeout, dropped
+  connection, crash while #cd[InFlight]), the worker verifies first. If the change already took
+  effect, the command is confirmed without being re-sent; this is also what prevents duplicate
+  copies and appends.
+- #key[What the agent hears.] After the 5 s wait the tool returns #cd[done] (confirmed),
+  #cd[failed] (permanent error, with the reason) or #cd[queued] (applied locally, not yet
+  confirmed — retrying in the background). The server instructions tell the agent not to report
+  a #cd[queued] change as done, and to check #cd[pending_commands] later.
 
 #callout(kind: "note", "Not queued")[
   SMTP sending, mailbox create / delete / rename, account and login tools, #cd[gmail_labels], and
@@ -460,7 +495,7 @@ parallel. It runs each command through the existing #cd[imap::\*] functions unde
   ("Tool(s)", "Behaviour with the cache"),
   ([#cd[list_messages], #cd[list_mailboxes], #cd[read_message]], [Served from the cache after a freshness check; #cd[read_message] stores the body on first read. New #cd[refresh] parameter.]),
   ([#cd[search_messages]], [Header, flag and date criteria run locally. Body-text search and #cd[gmail_query] still go to the server.]),
-  ([#cd[update_flags], #cd[move_messages], #cd[copy_messages], #cd[delete_messages]], [Enqueue, wait up to 5 s, return #cd[{ status: done | failed | queued, commands, error? }].]),
+  ([#cd[update_flags], #cd[move_messages], #cd[copy_messages], #cd[delete_messages]], [Enqueue, wait up to 5 s, return #cd[{ status: done | failed | queued, commands, error? }]. #cd[done] only once the server has confirmed and the read-back agrees (§ 5.3).]),
   ([#cd[send_email], #cd[reply_to_message], #cd[forward_message]], [SMTP directly, as now; the Sent copy is queued.]),
   ([#cd[pending_commands] #hot[new]], [Queued, in-flight and failed commands.]),
   ([#cd[retry_command] #hot[new]], [Re-arm a failed command.]),
@@ -469,8 +504,9 @@ parallel. It runs each command through the existing #cd[imap::\*] functions unde
   ([#cd[cache_status] #hot[new]], [Store sizes, last sync per mailbox, queue depth.]),
 )
 
-The server instructions gain one line: changes apply locally at once, survive restarts, and
-failures show up in #cd[pending_commands]. The #cd[remove_messages] guidance is unchanged — move to
+The server instructions gain two lines: changes apply locally at once and survive restarts, but
+are #cd[done] only once the server confirms them — a #cd[queued] change must not be reported to
+the user as done — and failures show up in #cd[pending_commands]. The #cd[remove_messages] guidance is unchanged — move to
 trash or delete, per account — both are now queued.
 
 == Lifecycle and configuration
@@ -503,10 +539,11 @@ with injected failures and simulated crashes.
 #dtable(
   columns: (auto, 1fr),
   ("Where", "What"),
-  ([yabiir], [Proptest model with scans; keydir benches for both orders.]),
+  ([yabiir], [Proptest model with scans; keydir benches, old hash vs new ordered, for the changelog.]),
+  ([email-mcp verification], [Against the fake server: an #cd[OK] that silently drops the change is retried, never reported #cd[done]\; a timeout followed by a change that did apply is confirmed without being re-sent; no duplicate Copy or Append.]),
   ([yabiir-tables], [Key-order property tests; table isolation; codec round-trips; schema mismatch.]),
   ([email-mcp crash ordering], [Kill between queue put and cache apply → replay on reopen repairs the cache. Kill mid-sync → next sync converges. Kill after the IMAP call, before dequeue → no duplicate Copy.]),
-  ([email-mcp unit], [Envelope parsing: encoded subjects and display names decode, addresses match case-insensitively; a #cd[SetFlags] writes only #cd[flags]; #cd[apply_local] is idempotent; replay never resurrects deleted mail; worker retry / failure paths against the fake.]),
+  ([email-mcp unit], [Envelope parsing: encoded subjects and display names decode, addresses match case-insensitively; a #cd[SetFlags] writes only #cd[flags]\; #cd[apply_local] is idempotent; replay never resurrects deleted mail; worker retry / failure paths against the fake.]),
   ([Manual, me.com], [Delete a few messages: they vanish at once, status #cd[done] within seconds, Apple Mail agrees. Network off: #cd[queued], drains after reconnecting. Delete `~/.cache/email-mcp`: nothing queued is lost.]),
 )
 
@@ -535,10 +572,6 @@ with injected failures and simulated crashes.
 - Transactions in #cd[yabiir-tables], if a use ever needs real atomicity.
 
 #callout(kind: "info", "Open for the next review round")[
-  - Should #cd[delete_messages] / #cd[move_messages] report #cd[done] only after the server
-    confirms, or is "applied locally, queued" enough when the 5 s wait expires?
   - Is 60 s the right default freshness, and should it differ per mailbox (INBOX vs archive)?
-  - Should #cd[Ordered] stay an option in yabiir, or become the only keydir from 1.0 on?
-  - Value formats are now proposed per table — JSON for envelopes, postcard for flags. Agree?
   - Should the optional #cd[text] table and the body-cache size cap be in v1, or deferred?
 ]
